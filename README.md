@@ -65,7 +65,6 @@ of those words to `claude` as a prompt instead, write `prism -- setup`.
 | `prism setup` | Create `~/.prism/` and write a default config. Safe to run again. |
 | `prism status` | Show which models your routes point to, plus a config hash. |
 | `prism doctor` | Check that litellm, your config, your keys, and `claude` are all good. |
-| `PRISM_BYPASS=1 prism …` | Run `claude` normally, with no proxy and no routing. |
 
 ## Pick your models (edit one file)
 
