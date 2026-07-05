@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prism-cc"
+version = "0.1.0"
+description = "Route Claude Code to any model — text to a cheap coder, images/files to a vision model — via a local LiteLLM proxy."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "MIT"
+authors = [{ name = "Kevin Lee" }]
+keywords = ["claude", "claude-code", "litellm", "llm", "proxy", "router", "glm", "openrouter"]
+dependencies = [
+    "litellm[proxy]>=1.83.0",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+prism = "prism.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kvnlee/prism"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prism"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

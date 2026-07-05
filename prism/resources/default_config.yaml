@@ -1,0 +1,51 @@
+# Prism config — edit freely. The command you run stays `prism`.
+#
+# Swap providers by editing this file only (never any code). `providers.<name>.type`
+# is a litellm provider slug (openrouter, zai, openai, gemini, anthropic, …) and is
+# what decides which backend a route calls. Model ids are provider-native:
+#   - OpenRouter carries a vendor segment:  z-ai/glm-4.6 , google/gemini-2.5-flash
+#   - Direct providers use bare ids:        glm-4.6 (zai) , gpt-4o-mini (openai)
+#
+# Routing: text/coding -> `coder`; images & files -> `multimodal`; cheap background
+# tasks -> `background`. Only requests that carry an image/file pay multimodal rates.
+
+schema_version: 1
+
+providers:
+  openrouter:
+    type: openrouter
+    api_key_env: OPENROUTER_API_KEY
+    # api_base: https://openrouter.ai/api/v1   # (optional override; native default is fine)
+
+routes:
+  coder:
+    provider: openrouter
+    model: z-ai/glm-4.6
+  background:
+    provider: openrouter
+    model: z-ai/glm-4.6
+  multimodal:
+    provider: openrouter
+    model: google/gemini-2.5-flash
+
+# Which Claude Code tier maps to which route.
+mapping:
+  opus: coder
+  sonnet: coder
+  haiku: background
+
+# ── Example: swap the coder to GLM direct from z.ai (no code change) ──────────────
+# providers:
+#   zai:
+#     type: zai                 # native litellm provider: auto base + reads the key env
+#     api_key_env: ZAI_API_KEY
+# routes:
+#   coder:   { provider: zai, model: glm-4.6 }
+#
+# ── Example: multimodal via Gemini direct (Google AI Studio) ─────────────────────
+# providers:
+#   gemini:
+#     type: gemini
+#     api_key_env: GEMINI_API_KEY
+# routes:
+#   multimodal: { provider: gemini, model: gemini-2.5-flash }
