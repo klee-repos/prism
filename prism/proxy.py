@@ -81,10 +81,9 @@ def assert_version_ok() -> str:
 class Proxy:
     """A supervised litellm child process."""
 
-    def __init__(self, port: int, gen_config: Path, master_key: str, log_fd: int, popen) -> None:
+    def __init__(self, port: int, gen_config: Path, log_fd: int, popen) -> None:
         self.port = port
         self.gen_config = gen_config
-        self.master_key = master_key
         self._log_fd = log_fd
         self._proc = popen
 
@@ -159,7 +158,7 @@ def _assert_loopback_only(port: int) -> None:
             )
 
 
-def start(cfg: dict, master_key: str) -> Proxy:
+def start(cfg: dict) -> Proxy:
     """Spawn the litellm proxy as a supervised child and block until it is ready."""
     assert_version_ok()
     home = cfgmod.prism_home()
@@ -174,12 +173,13 @@ def start(cfg: dict, master_key: str) -> Proxy:
     # Truncate + 0600 so a long-lived user's log can't grow forever / be world-read.
     log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 
-    env = {**os.environ, cfgmod.MASTER_KEY_ENV: master_key}
+    # Child inherits our environment (provider key envs like OPENROUTER_API_KEY live there);
+    # the proxy needs no key of its own — it's loopback-only.
     proc = subprocess.Popen(
         [str(litellm_bin()), "--config", str(gen), "--host", "127.0.0.1", "--port", str(port)],
-        stdout=log_fd, stderr=log_fd, env=env, cwd=str(home), start_new_session=True,
+        stdout=log_fd, stderr=log_fd, cwd=str(home), start_new_session=True,
     )
-    proxy = Proxy(port, gen, master_key, log_fd, proc)
+    proxy = Proxy(port, gen, log_fd, proc)
     try:
         _wait_ready(proc, port, READINESS_TIMEOUT_S, log_file)
         _assert_loopback_only(port)

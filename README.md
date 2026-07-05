@@ -1,25 +1,41 @@
 # Prism
 
-**Route Claude Code to any model.** Prism sits in front of the `claude` CLI and splits each
-request by "wavelength": text and coding go to a cheap coder model, images and files go to a
-multimodal model — each to the right place, any provider. You keep the entire Claude Code
-experience (dynamic workflows, MCP, `--dangerously-skip-permissions`, everything); only the model
-underneath changes.
+**Route Claude Code to any model — pay coder prices for text, see images for free.**
+
+Prism is a thin launcher that sits in front of the `claude` CLI and splits each request by
+"wavelength": text and code go to a cheap coder model, images and files get rerouted to a
+multimodal model — each to the right provider, automatically. You keep the **entire** Claude
+Code experience (dynamic workflows, MCP, sub-agents, `--dangerously-skip-permissions`,
+everything) — only the model underneath changes.
 
 ```
         prism  <your usual claude args>
           │
           ▼
    ┌─────────────────────────────┐
-   │  local LiteLLM proxy         │   text/coding ─▶  coder      (e.g. GLM-4.6, cheap)
+   │  local LiteLLM proxy         │   text / code  ─▶ coder      (e.g. GLM-5.2, cheap)
    │  (per-session, 127.0.0.1)    │   image / file ─▶ multimodal (e.g. Gemini, sees it)
    └─────────────────────────────┘
 ```
 
-Why it exists: GLM's coder models can't see images, and Claude Code can only talk the Anthropic
-protocol. Prism runs a local [LiteLLM](https://github.com/BerriAI/litellm) proxy that translates
-the protocol *and* reroutes any request carrying an image/file to a model that can actually read it —
-while your text stays on the cheap coder. One tool, full capability parity.
+### Why
+
+GLM's coder models are fast and cheap — but they can't see images, and Claude Code only speaks
+the Anthropic protocol. Prism runs a local [LiteLLM](https://github.com/BerriAI/litellm) proxy
+that translates the protocol *and* reroutes any request carrying an image or file to a model that
+can actually read it — while your text stays on the cheap coder. One tool, full capability parity,
+no code changes.
+
+### Highlights
+
+- **Passthrough-first.** `prism` forwards every flag to `claude` verbatim. Nothing is intercepted
+  or rewritten except the model destination.
+- **Provider-agnostic.** Swap backends by editing one YAML file — OpenRouter, z.ai, OpenAI,
+  Gemini, Anthropic, Azure, Bedrock, any LiteLLM provider slug.
+- **Loopback-only & per-session.** The proxy binds `127.0.0.1`, is torn down when `claude` exits,
+  and never holds a port open between runs. No daemon, no keys on disk.
+- **Honest about limits.** Video isn't reachable; PDFs are best-effort. Documented below, not
+  hidden.
 
 ## Install
 
@@ -43,9 +59,14 @@ prism --resume
 ```
 
 Only three words are reserved for Prism itself: `setup`, `status`, `doctor`. If you ever need to
-send one of those to claude as a prompt, use the escape hatch: `prism -- setup`.
+send one of those to `claude` as a prompt, use the escape hatch: `prism -- setup`.
 
-Set `PRISM_BYPASS=1` to run `claude` completely untouched (no proxy, no routing).
+| Command | What it does |
+| --- | --- |
+| `prism setup` | Provision `~/.prism/` and write a default config. Safe to re-run. |
+| `prism status` | Show the active routes and a config hash (drift check). |
+| `prism doctor` | Verify litellm version, config validity, provider keys, and `claude` on PATH. |
+| `PRISM_BYPASS=1 prism …` | Run `claude` completely untouched — no proxy, no routing. |
 
 ## Configure any provider (no code change)
 
@@ -59,8 +80,8 @@ providers:
     type: openrouter
     api_key_env: OPENROUTER_API_KEY
 routes:
-  coder:      { provider: openrouter, model: z-ai/glm-4.6 }        # OpenRouter ids are vendor-prefixed
-  background: { provider: openrouter, model: z-ai/glm-4.6 }
+  coder:      { provider: openrouter, model: z-ai/glm-5.2 }        # OpenRouter ids are vendor-prefixed
+  background: { provider: openrouter, model: z-ai/glm-4.7-flash }
   multimodal: { provider: openrouter, model: google/gemini-2.5-flash }
 mapping:
   opus: coder
@@ -74,7 +95,7 @@ mapping:
 providers:
   zai: { type: zai, api_key_env: ZAI_API_KEY }
 routes:
-  coder: { provider: zai, model: glm-4.6 }
+  coder: { provider: zai, model: glm-5.2 }
 ```
 
 Other `type` values: `openai`, `gemini`, `anthropic`, `azure`, `bedrock`, … (any LiteLLM provider
@@ -97,11 +118,16 @@ requests that actually contain a picture or file.
 
 ## Security
 
-- The proxy binds **127.0.0.1 only** and requires a generated master key (mandatory — no unauthenticated
-  mode). Keys are referenced by env var, never written into config. `~/.prism/` is `0700`, its files `0600`.
-- The proxy runs **per session** and is torn down when `claude` exits — no lingering daemon.
-- Note: any process `claude` spawns (MCP servers, hooks, the Bash tool) inherits the proxy auth token,
-  same as with a real Anthropic key. Keep it loopback-only.
+- The proxy binds **127.0.0.1 only** — never a routable interface. That loopback binding is the
+  trust boundary: only processes already on your machine can reach it. Provider keys are referenced
+  by env var, never written into config. `~/.prism/` is `0700`, its files `0600`.
+- The proxy runs **per session** and is torn down when `claude` exits — no lingering daemon, no
+  port held open between runs.
+- **The proxy is intentionally unauthenticated** (no master key). Claude Code, when you're signed
+  in to a Claude subscription, forwards *its own* OAuth token regardless of `ANTHROPIC_AUTH_TOKEN`
+  — so a mandatory proxy key would reject that token and break the launch. Loopback-only +
+  per-session lifetime is the boundary instead; anything that can reach the port can already run
+  code as you. Don't rebind it off `127.0.0.1`.
 
 ## Develop
 
@@ -111,4 +137,6 @@ pip install -e ".[dev]"
 pytest -q
 ```
 
-MIT licensed.
+## License
+
+MIT © Kevin Lee

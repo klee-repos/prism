@@ -5,7 +5,7 @@ A stranger swaps providers by editing ``~/.prism/config.yaml`` — never any cod
 one field that decides the backend is ``providers.<name>.type``, a litellm provider
 *slug* (``openrouter``, ``zai``, ``openai``, ``gemini``, ``anthropic``, …), validated
 against ``litellm.provider_list``. Model ids are provider-native (OpenRouter carries a
-vendor segment, e.g. ``z-ai/glm-4.6``).
+vendor segment, e.g. ``z-ai/glm-5.2``).
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ SCHEMA_VERSION = 1
 REQUIRED_ROLES = ("coder", "background", "multimodal")
 MAPPING_SLOTS = ("opus", "sonnet", "haiku")
 
-MASTER_KEY_ENV = "PRISM_MASTER_KEY"
 HOOK_REF = "prism_hook.instance"
 
 
@@ -31,10 +30,6 @@ def prism_home() -> Path:
 
 def config_path() -> Path:
     return prism_home() / "config.yaml"
-
-
-def master_key_path() -> Path:
-    return prism_home() / "master_key"
 
 
 def hook_shim_path() -> Path:
@@ -117,6 +112,8 @@ def validate(cfg: dict, known_providers: set[str] | None = None) -> None:
             raise ConfigError(
                 f"route '{role}' references provider '{r['provider']}' which is not defined."
             )
+        if "extra_body" in r and not isinstance(r["extra_body"], dict):
+            raise ConfigError(f"route '{role}' has a non-mapping `extra_body` (must be a YAML mapping).")
 
     for slot, target in mapping.items():
         if slot not in MAPPING_SLOTS:
@@ -149,6 +146,8 @@ def _route_params(cfg: dict, role: str) -> dict:
     }
     if prov.get("api_base"):  # only override when a provider explicitly needs it
         params["api_base"] = prov["api_base"]
+    if route.get("extra_body"):  # provider-native passthrough (e.g. OpenRouter provider routing)
+        params["extra_body"] = route["extra_body"]
     return params
 
 
@@ -160,10 +159,13 @@ def to_litellm_config(cfg: dict) -> dict:
     # Catch-all so any model name Claude Code sends (e.g. `--model opus`) resolves to coder.
     coder_params = dict(_route_params(cfg, "coder"))
     model_list.append({"model_name": "*", "litellm_params": coder_params})
+    # No `general_settings.master_key`: the proxy is loopback-only (127.0.0.1) and does
+    # not gate requests on a key. Claude Code, when signed in to a Claude subscription,
+    # forwards its own OAuth token regardless of env vars — a mandatory proxy key would
+    # reject that token and break the whole point. Loopback binding is the trust boundary.
     return {
         "model_list": model_list,
         "litellm_settings": {"callbacks": HOOK_REF},
-        "general_settings": {"master_key": f"os.environ/{MASTER_KEY_ENV}"},
     }
 
 

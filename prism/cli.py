@@ -7,7 +7,6 @@ Use `prism -- <args>` to force a collision word through to claude.
 from __future__ import annotations
 
 import os
-import secrets
 import signal
 import subprocess
 import sys
@@ -23,6 +22,11 @@ NO_COMPLETION_SUBCOMMANDS = {
     "install", "setup-token", "agents", "gateway", "auto-mode",
 }
 EXIT_PRISM_ERROR = 2  # Prism's own failures; claude's exit code is propagated otherwise.
+
+# The proxy is loopback-only and unauthenticated, so this token is never checked — it
+# exists only so Claude Code always has *a* credential to send (a fresh, not-signed-in
+# machine would otherwise refuse to make the request). Not a secret.
+LOCAL_AUTH_TOKEN = "sk-prism-localhost-noauth"
 
 
 class PrismError(Exception):
@@ -56,10 +60,10 @@ def requires_completion(forward_args: list[str]) -> bool:
     return True
 
 
-def build_claude_env(base_env: dict, base_url: str, token: str, cfg: dict) -> dict:
+def build_claude_env(base_env: dict, base_url: str, cfg: dict) -> dict:
     env = dict(base_env)
     env["ANTHROPIC_BASE_URL"] = base_url
-    env["ANTHROPIC_AUTH_TOKEN"] = token
+    env["ANTHROPIC_AUTH_TOKEN"] = LOCAL_AUTH_TOKEN
     env.update(cfgmod.mapping_env(cfg))
     return env
 
@@ -70,17 +74,6 @@ def _ensure_home() -> None:
     home = cfgmod.prism_home()
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
-
-
-def _ensure_master_key() -> str:
-    p = cfgmod.master_key_path()
-    if p.exists():
-        return p.read_text().strip()
-    key = "sk-prism-" + secrets.token_hex(24)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(key)
-    return key
 
 
 def _write_hook_shim() -> None:
@@ -98,13 +91,12 @@ def _write_hook_shim() -> None:
 
 
 def _provision() -> None:
-    """Idempotently create ~/.prism (config, master key, hook shim). Safe to re-run."""
+    """Idempotently create ~/.prism (config, hook shim). Safe to re-run."""
     _ensure_home()
     cfg_p = cfgmod.config_path()
     if not cfg_p.exists():
         cfg_p.write_text(cfgmod._default_config_text())
     os.chmod(cfg_p, 0o600)
-    _ensure_master_key()
     _write_hook_shim()
 
 
@@ -220,10 +212,9 @@ def run_passthrough(forward_args: list[str]) -> int:
             )
 
     _warn_env_override(dict(os.environ))
-    master_key = _ensure_master_key()
-    proxy = proxymod.start(cfg, master_key)
+    proxy = proxymod.start(cfg)
     try:
-        env = build_claude_env(dict(os.environ), proxy.base_url, master_key, cfg)
+        env = build_claude_env(dict(os.environ), proxy.base_url, cfg)
         return _exec_claude(forward_args, env)
     finally:
         proxy.stop()

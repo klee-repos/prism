@@ -23,4 +23,3 @@ def test_to_litellm_config_never_inlines_a_literal_key():
     for m in out["model_list"]:
         api_key = m["litellm_params"]["api_key"]
         assert api_key.startswith("os.environ/"), api_key
-    assert out["general_settings"]["master_key"].startswith("os.environ/")

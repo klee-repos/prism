@@ -3,8 +3,8 @@
 # Swap providers by editing this file only (never any code). `providers.<name>.type`
 # is a litellm provider slug (openrouter, zai, openai, gemini, anthropic, …) and is
 # what decides which backend a route calls. Model ids are provider-native:
-#   - OpenRouter carries a vendor segment:  z-ai/glm-4.6 , google/gemini-2.5-flash
-#   - Direct providers use bare ids:        glm-4.6 (zai) , gpt-4o-mini (openai)
+#   - OpenRouter carries a vendor segment:  z-ai/glm-5.2 , google/gemini-2.5-flash
+#   - Direct providers use bare ids:        glm-5.2 (zai) , gpt-4o-mini (openai)
 #
 # Routing: text/coding -> `coder`; images & files -> `multimodal`; cheap background
 # tasks -> `background`. Only requests that carry an image/file pay multimodal rates.
@@ -20,10 +20,23 @@ providers:
 routes:
   coder:
     provider: openrouter
-    model: z-ai/glm-4.6
+    model: z-ai/glm-5.2
+    # OpenRouter serves one model id from several upstream providers and load-balances
+    # on price/uptime by default. Claude Code leans hard on tool calls and consistent
+    # quality, so pin the coder route: `require_parameters` keeps it on providers that
+    # honor the tools/params we send, and `quantizations` restricts to FP8-or-better
+    # (excludes int4/int8/fp4/fp6 and undeclared `unknown`). See OpenRouter provider
+    # routing docs. Any keys under `extra_body` pass through to the backend verbatim.
+    extra_body:
+      provider:
+        require_parameters: true
+        quantizations: [fp8, fp16, bf16, fp32]
   background:
     provider: openrouter
-    model: z-ai/glm-4.6
+    model: z-ai/glm-4.7-flash
+    extra_body:
+      provider:
+        quantizations: [fp8, fp16, bf16, fp32]   # same FP8-or-better quality floor as coder
   multimodal:
     provider: openrouter
     model: google/gemini-2.5-flash
@@ -40,7 +53,7 @@ mapping:
 #     type: zai                 # native litellm provider: auto base + reads the key env
 #     api_key_env: ZAI_API_KEY
 # routes:
-#   coder:   { provider: zai, model: glm-4.6 }
+#   coder:   { provider: zai, model: glm-5.2 }
 #
 # ── Example: multimodal via Gemini direct (Google AI Studio) ─────────────────────
 # providers:

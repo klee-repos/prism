@@ -41,9 +41,9 @@ def test_requires_completion():
 
 def test_build_claude_env_sets_all_expected():
     cfg = {"mapping": {"opus": "coder", "sonnet": "coder", "haiku": "background"}}
-    env = cli.build_claude_env({"PATH": "/x"}, "http://127.0.0.1:5000", "sk-key", cfg)
+    env = cli.build_claude_env({"PATH": "/x"}, "http://127.0.0.1:5000", cfg)
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:5000"
-    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-key"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == cli.LOCAL_AUTH_TOKEN
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "coder"
     assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "coder"
     assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "background"

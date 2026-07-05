@@ -111,18 +111,18 @@ def running_proxy(tmp_path, monkeypatch):
         home.mkdir(parents=True, exist_ok=True)
         cfgmod.config_path().write_text(yaml.safe_dump(cfg))
         cli._write_hook_shim()
-        master_key = cli._ensure_master_key()
-        proxy = proxymod.start(cfg, master_key)
+        proxy = proxymod.start(cfg)
         try:
-            yield mock, proxy, master_key
+            yield mock, proxy
         finally:
             proxy.stop()
 
 
-def _send(proxy, master_key, messages):
+def _send(proxy, messages):
+    # No Authorization header: the proxy is loopback-only and does not gate on a key.
     r = httpx.post(
         f"{proxy.base_url}/v1/messages",
-        headers={"Authorization": f"Bearer {master_key}", "content-type": "application/json"},
+        headers={"content-type": "application/json"},
         json={"model": "coder", "max_tokens": 16, "messages": messages},
         timeout=30.0,
     )
@@ -131,15 +131,15 @@ def _send(proxy, master_key, messages):
 
 
 def test_text_request_routes_to_coder(running_proxy):
-    mock, proxy, key = running_proxy
-    _send(proxy, key, [{"role": "user", "content": "hello there"}])
+    mock, proxy = running_proxy
+    _send(proxy, [{"role": "user", "content": "hello there"}])
     assert mock.requests, "mock upstream received nothing"
     assert mock.requests[-1]["model"] == "prism-coder-model"
 
 
 def test_image_request_routes_to_multimodal(running_proxy):
-    mock, proxy, key = running_proxy
-    _send(proxy, key, [{
+    mock, proxy = running_proxy
+    _send(proxy, [{
         "role": "user",
         "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMG_B64}},
@@ -152,8 +152,8 @@ def test_image_request_routes_to_multimodal(running_proxy):
 
 
 def test_hook_fired_marker_in_proxy_log(running_proxy):
-    mock, proxy, key = running_proxy
-    _send(proxy, key, [{"role": "user", "content": "ping"}])
+    mock, proxy = running_proxy
+    _send(proxy, [{"role": "user", "content": "ping"}])
     log = cfgmod.log_path().read_text(errors="replace")
     assert "prism.hook.fired" in log, "hook never logged its fire marker (was it importable?)"
 
@@ -213,8 +213,8 @@ def test_run_passthrough_boots_a_routed_proxy_and_wires_env(tmp_path, monkeypatc
 
 def test_tool_result_nested_image_routes_to_multimodal(running_proxy):
     # R1 end-to-end: an image returned inside a tool_result must still route multimodal.
-    mock, proxy, key = running_proxy
-    _send(proxy, key, [
+    mock, proxy = running_proxy
+    _send(proxy, [
         {"role": "user", "content": "look at this"},
         {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
         {"role": "user", "content": [{
