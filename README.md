@@ -107,28 +107,6 @@ inside a tool's output), that request goes to the `multimodal` model; otherwise 
 whichever model Claude Code picked. You only pay the vision-model price on requests that actually
 have a picture or file.
 
-## Known limits (honest)
-
-- **Video** isn't supported — Claude Code's protocol has no way to send video, regardless of model.
-- **PDFs / documents** are best-effort: the token counter sometimes chokes on Anthropic document
-  blocks. If you send documents a lot, point `multimodal` at a provider that handles them natively
-  (like Gemini) and test your case.
-- **Anthropic Files-API `file_id`** references only work on Anthropic's own backend.
-
-## Security
-
-- The proxy only listens on **`127.0.0.1`** — your machine's loopback address, never the network.
-  That's the trust boundary: only programs already running on your computer can reach it. Your
-  provider keys are read from environment variables, never saved into the config file. The
-  `~/.prism/` folder is locked to your user (`0700`), and its files are `0600`.
-- The proxy **runs only for the session** and is stopped when `claude` exits — no lingering daemon,
-  no port left open between runs.
-- The proxy has **no password of its own**. Claude Code, when you're signed in to a Claude
-  subscription, sends its own login token — and if Prism demanded its own key, that token would be
-  rejected and the whole thing would break. Loopback-only plus short lifetime is the boundary
-  instead: anyone who can reach the port can already run code as you, so don't expose it beyond
-  `127.0.0.1`.
-
 ## Develop
 
 ```sh
@@ -136,7 +114,3 @@ python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 pytest -q
 ```
-
-## License
-
-MIT © Kevin Lee
