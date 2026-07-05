@@ -188,17 +188,13 @@ def _warn_env_override(base_env: dict) -> None:
         val = base_env.get(var)
         if val and "PRISM" not in val:
             print(
-                f"prism: overriding your existing {var} to route through the local proxy "
-                "(set PRISM_BYPASS=1 to run claude untouched).",
+                f"prism: overriding your existing {var} to route through the local proxy.",
                 file=sys.stderr,
             )
             return
 
 
 def run_passthrough(forward_args: list[str]) -> int:
-    if os.environ.get("PRISM_BYPASS") == "1":
-        return _exec_claude(forward_args)
-
     _provision()  # idempotent: first run works without an explicit `prism setup`
     cfg = cfgmod.load_config()
     cfgmod.validate(cfg)
