@@ -24,7 +24,7 @@ dev = ["pytest>=8.0"]
 prism = "prism.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/kvnlee/prism"
+Homepage = "https://github.com/klee-repos/prism"
 
 [tool.hatch.build.targets.wheel]
 packages = ["prism"]
