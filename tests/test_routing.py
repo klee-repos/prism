@@ -88,3 +88,93 @@ def test_router_honors_env_route(monkeypatch):
 def test_router_no_messages_key_is_safe():
     data = {"model": "coder"}
     assert ModalityRouter().route(data)["model"] == "coder"
+
+
+# ── hosted web_search tool handling (the WebSearch InputValidationError-loop fix) ──
+# Without a search provider configured, the hosted tool is *stripped* (Prism's
+# backends can't execute it). With PRISM_SEARCH=1 (a provider is wired), it is
+# *converted* to litellm's callable `litellm_web_search` function tool, which
+# litellm's websearch_interception callback then serves.
+
+def test_hosted_web_search_tool_is_stripped_by_default(monkeypatch):
+    # No search provider → strip the hosted tool, keep custom tools.
+    monkeypatch.delenv("PRISM_SEARCH", raising=False)
+    data = {"model": "coder", "messages": [{"role": "user", "content": "hi"}], "tools": [
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+        {"name": "Bash", "description": "x", "input_schema": {"type": "object"}},
+    ]}
+    tools = ModalityRouter().route(data)["tools"]
+    assert [t.get("name") for t in tools] == ["Bash"]
+
+
+def test_hosted_web_search_tool_is_converted_when_search_enabled(monkeypatch):
+    # With a search provider wired, the hosted tool becomes the callable standard tool.
+    monkeypatch.setenv("PRISM_SEARCH", "1")
+    data = {"model": "coder", "messages": [{"role": "user", "content": "hi"}], "tools": [
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+        {"name": "Bash", "description": "x", "input_schema": {"type": "object"}},
+    ]}
+    tools = ModalityRouter().route(data)["tools"]
+    names = [t.get("name") for t in tools]
+    assert "litellm_web_search" in names and "Bash" in names
+    ws = next(t for t in tools if t.get("name") == "litellm_web_search")
+    assert ws["input_schema"]["required"] == ["query"]
+    # No hosted-type remnants leak through.
+    assert "web_search_20250305" not in str(tools)
+
+
+def test_duplicate_hosted_web_search_becomes_single_function_tool(monkeypatch):
+    monkeypatch.setenv("PRISM_SEARCH", "1")
+    data = {"tools": [
+        {"type": "web_search_20250305", "name": "web_search"},
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]}
+    tools = ModalityRouter().route(data)["tools"]
+    assert [t.get("name") for t in tools] == ["litellm_web_search"]
+
+
+# ── mixed-tool agentic follow-up model qualification (litellm bug workaround) ─────
+
+def test_provider_prefix_list_treats_vendor_slash_as_unqualified():
+    # The whole reason the mixed-tool follow-up broke: litellm's `"/" in model` check
+    # sees "z-ai/glm-5.2" (vendor/model), assumes it's already provider-qualified, and
+    # skips prepending "openrouter/" — so the follow-up can't resolve a provider. Our
+    # list of known provider prefixes must NOT match "z-ai/...", so the patch prepends.
+    from prism.routing import _LITELLM_PROVIDER_PREFIXES
+    bare = "z-ai/glm-5.2"
+    assert not any(bare.startswith(p + "/") for p in _LITELLM_PROVIDER_PREFIXES), (
+        f"'z-ai/glm-5.2' must be treated as bare (vendor-prefixed), not provider-qualified"
+    )
+    # An already-qualified model must be left alone:
+    qualified = "openrouter/z-ai/glm-5.2"
+    assert any(qualified.startswith(p + "/") for p in _LITELLM_PROVIDER_PREFIXES)
+
+
+def test_hosted_tool_future_version_prefix_matches(monkeypatch):
+    # The `startswith` check covers future Anthropic web_search versions.
+    monkeypatch.delenv("PRISM_SEARCH", raising=False)
+    data = {"tools": [{"type": "web_search_20261120", "name": "web_search"}]}
+    assert "tools" not in ModalityRouter().route(data)
+
+
+def test_custom_tool_with_type_custom_is_kept():
+    # A plain custom tool may carry type "custom" — must NOT be stripped/converted.
+    data = {"tools": [{"type": "custom", "name": "Bash", "input_schema": {"type": "object"}}]}
+    assert ModalityRouter().route(data)["tools"] == data["tools"]
+
+
+def test_all_hosted_tools_drops_tools_and_tool_choice(monkeypatch):
+    # No search provider + every tool hosted → drop `tools` entirely (an empty array
+    # is rejected by some backends) and take the now-orphaned `tool_choice` with it.
+    monkeypatch.delenv("PRISM_SEARCH", raising=False)
+    data = {"model": "coder", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "tool_choice": {"type": "auto"}}
+    out = ModalityRouter().route(data)
+    assert "tools" not in out
+    assert "tool_choice" not in out
+
+
+def test_no_tools_key_is_safe():
+    data = {"model": "coder", "messages": [{"role": "user", "content": "hi"}]}
+    assert ModalityRouter().route(data) == {**data, "model": "coder"}

@@ -60,6 +60,7 @@ class MockUpstream:
                 outer.requests.append({
                     "model": payload.get("model"),
                     "had_image": _messages_have_image(payload.get("messages", [])),
+                    "tools": payload.get("tools"),
                 })
                 self._json({
                     "id": "chatcmpl-mock", "object": "chat.completion", "created": 0,
@@ -223,3 +224,249 @@ def test_tool_result_nested_image_routes_to_multimodal(running_proxy):
         }]},
     ])
     assert mock.requests[-1]["model"] == "prism-mm-model"
+
+
+def test_hosted_web_search_tool_is_stripped_before_upstream(running_proxy):
+    # No search provider configured → strip the hosted tool (backends can't run it),
+    # keep custom tools. This is the default and the guard against the
+    # InputValidationError loop.
+    mock, proxy = running_proxy
+    r = httpx.post(
+        f"{proxy.base_url}/v1/messages",
+        headers={"content-type": "application/json"},
+        json={"model": "coder", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "search the web"}],
+              "tools": [
+                  {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                  {"name": "Bash", "description": "x", "input_schema": {"type": "object"}},
+              ]},
+        timeout=30.0,
+    )
+    assert r.status_code == 200, r.text
+    last = mock.requests[-1]
+    tools = last["tools"]
+    # The hosted web_search tool never reached the upstream…
+    assert tools is not None and not any(
+        isinstance(t, dict) and isinstance(t.get("type"), str) and t["type"].startswith("web_search")
+        for t in tools
+    ), "hosted web_search tool was not stripped before the upstream model"
+    # …but the plain custom Bash tool did survive.
+    assert any(isinstance(t, dict) and t.get("name") == "Bash" for t in tools)
+
+
+@pytest.fixture()
+def search_enabled_proxy(tmp_path, monkeypatch):
+    """A proxy with a search provider wired (PRISM_SEARCH=1) so the hook *converts*
+    the hosted web_search tool to litellm's callable ``litellm_web_search`` instead
+    of stripping it. The search provider points at a dummy host; we only assert the
+    tool-shape the LLM upstream receives, not the search-loop's execution."""
+    monkeypatch.setenv("PRISM_HOME", str(tmp_path / ".prism"))
+    monkeypatch.setenv("PRISM_TEST_KEY", "sk-dummy-not-real")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-dummy-not-real")
+    monkeypatch.setenv("PRISM_SEARCH", "1")
+    with MockUpstream() as mock:
+        cfg = {
+            "schema_version": 1,
+            "providers": {"mock": {
+                # openrouter routes /v1/messages through the chat-completions path
+                # (where the conversion is observable at the upstream), unlike `openai`
+                # which uses the Responses API path.
+                "type": "openrouter", "api_key_env": "PRISM_TEST_KEY",
+                "api_base": f"http://127.0.0.1:{mock.port}",
+            }},
+            "routes": {
+                "coder": {"provider": "mock", "model": "prism-coder-model"},
+                "background": {"provider": "mock", "model": "prism-bg-model"},
+                "multimodal": {"provider": "mock", "model": "prism-mm-model"},
+            },
+            "mapping": {"opus": "coder", "sonnet": "coder", "haiku": "background"},
+            "search": {"provider": "firecrawl", "api_key_env": "FIRECRAWL_API_KEY"},
+        }
+        home = cfgmod.prism_home()
+        home.mkdir(parents=True, exist_ok=True)
+        cfgmod.config_path().write_text(yaml.safe_dump(cfg))
+        cli._write_hook_shim()
+        proxy = proxymod.start(cfg)
+        try:
+            yield mock, proxy
+        finally:
+            proxy.stop()
+
+
+def _tool_name(t: dict) -> str:
+    """Effective tool name, handling the OpenAI ``{type:function, function:{name}}`` shape."""
+    if t.get("type") == "function" and isinstance(t.get("function"), dict):
+        return t["function"].get("name", "")
+    return t.get("name", "")
+
+
+def test_hosted_web_search_is_converted_when_search_enabled(search_enabled_proxy):
+    # With a search provider wired, the hook converts the hosted web_search tool to
+    # litellm's standard callable ``litellm_web_search`` function tool — so the model
+    # can call it and litellm's websearch_interception callback serves the search.
+    mock, proxy = search_enabled_proxy
+    r = httpx.post(
+        f"{proxy.base_url}/v1/messages",
+        headers={"content-type": "application/json"},
+        json={"model": "coder", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "search the web"}],
+              "tools": [
+                  {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                  {"name": "Bash", "description": "x", "input_schema": {"type": "object"}},
+              ]},
+        timeout=30.0,
+    )
+    assert r.status_code == 200, r.text
+    last = mock.requests[-1]
+    tools = last["tools"]
+    names = [_tool_name(t) for t in tools if isinstance(t, dict)]
+    # The model now sees a callable litellm_web_search function tool (not the hosted
+    # server tool that would loop it).
+    assert "litellm_web_search" in names, (
+        "hosted web_search was not converted to the callable litellm_web_search tool; "
+        f"model saw: {names}"
+    )
+    # No hosted-type remnants leak through.
+    assert not any(
+        isinstance(t, dict) and isinstance(t.get("type"), str) and t["type"].startswith("web_search")
+        for t in tools
+    )
+    # Custom Bash tool still survives alongside.
+    assert "Bash" in names
+
+
+def test_mixed_tool_websearch_loop_completes(tmp_path, monkeypatch):
+    # Regression for the litellm mixed-tool agentic-loop bug: when web_search is sent
+    # alongside Bash, litellm's _execute_chat_completion_agentic_plan left the follow-up
+    # model as the bare "z-ai/..." deployment id → "LLM Provider NOT provided" → the
+    # loop aborted before the follow-up call. Prism's follow-up patch qualifies the
+    # model, so the loop must now reach the second LLM call.
+    monkeypatch.setenv("PRISM_HOME", str(tmp_path / ".prism"))
+    monkeypatch.setenv("PRISM_TEST_KEY", "sk-dummy-not-real")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-dummy-not-real")
+    monkeypatch.setenv("PRISM_SEARCH", "1")
+
+    # A mock LLM upstream that calls litellm_web_search on turn 1, then synthesizes.
+    import json as _json
+    llm_calls = {"n": 0}
+
+    class LLMHandler(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def do_GET(self):
+            self._json({"data": [], "object": "list"})
+
+        def do_POST(self):
+            llm_calls["n"] += 1
+            length = int(self.headers.get("Content-Length", 0))
+            payload = _json.loads(self.rfile.read(length)) if length else {}
+            outer = self  # for capturing in the closure below
+            if llm_calls["n"] == 1:
+                resp = {"id": "x", "object": "chat.completion", "created": 0, "model": "glm",
+                        "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                     "message": {"role": "assistant", "content": None,
+                                                 "tool_calls": [{"id": "c1", "type": "function",
+                                                                 "function": {"name": "litellm_web_search",
+                                                                              "arguments": _json.dumps({"query": "maestro yaml"})}}]}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+            else:
+                resp = {"id": "y", "object": "chat.completion", "created": 0, "model": "glm",
+                        "choices": [{"index": 0, "finish_reason": "stop",
+                                     "message": {"role": "assistant", "content": "synthesized answer"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+            self._json(resp)
+
+        def _json(self, obj):
+            data = _json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    llm_srv = ThreadingHTTPServer(("127.0.0.1", 0), LLMHandler)
+    llm_port = llm_srv.server_address[1]
+    threading.Thread(target=llm_srv.serve_forever, daemon=True).start()
+
+    # Stub litellm.asearch so the search runs without a real Firecrawl key/network.
+    import litellm
+
+    async def fake_asearch(**kwargs):
+        from litellm.types.utils import SearchResponse, SearchAPIResult
+        return SearchResponse(results=[SearchAPIResult(
+            title="Maestro YAML Guide", url="https://maestro.mobile/yaml",
+            content="flow: and commands: are top-level keys", score=0.9,
+        )])
+    monkeypatch.setattr(litellm, "asearch", fake_asearch)
+
+    cfg = {
+        "schema_version": 1,
+        "providers": {"mock": {
+            "type": "openrouter", "api_key_env": "PRISM_TEST_KEY",
+            "api_base": f"http://127.0.0.1:{llm_port}",
+        }},
+        "routes": {
+            "coder": {"provider": "mock", "model": "z-ai/glm-5.2"},
+            "background": {"provider": "mock", "model": "z-ai/glm-4.7-flash"},
+            "multimodal": {"provider": "mock", "model": "google/gemini-2.5-flash"},
+        },
+        "mapping": {"opus": "coder", "sonnet": "coder", "haiku": "background"},
+        "search": {"provider": "firecrawl", "api_key_env": "FIRECRAWL_API_KEY"},
+    }
+    home = cfgmod.prism_home()
+    home.mkdir(parents=True, exist_ok=True)
+    cfgmod.config_path().write_text(yaml.safe_dump(cfg))
+    cli._write_hook_shim()
+    proxy = proxymod.start(cfg)
+    try:
+        r = httpx.post(
+            f"{proxy.base_url}/v1/messages",
+            headers={"content-type": "application/json"},
+            json={"model": "coder", "max_tokens": 200,
+                  "messages": [{"role": "user", "content": "search for maestro yaml syntax"}],
+                  "tools": [
+                      {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                      {"name": "Bash", "description": "x",
+                       "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}},
+                  ]},
+            timeout=60.0,
+        )
+    finally:
+        proxy.stop()
+        llm_srv.shutdown()
+
+    assert r.status_code == 200, r.text
+    # Two LLM upstream calls = the model called web_search on turn 1, litellm ran the
+    # search, and the follow-up synthesis call (turn 2) actually executed. Before the
+    # patch, the second call never happened (the loop aborted with "LLM Provider NOT
+    # provided").
+    assert llm_calls["n"] >= 2, (
+        f"mixed-tool agentic loop did not reach the follow-up call "
+        f"(only {llm_calls['n']} LLM call(s)) — the provider-qualification patch "
+        "may have regressed."
+    )
+
+
+def test_disconnect_metadata_patch_handles_none():
+    # litellm 1.91.0's _record_streaming_client_disconnect_if_needed hands metadata
+    # obtained via setdefault("metadata", {}) to _apply_client_disconnect_metadata,
+    # but a slot can pre-exist as None → setdefault returns None → the bare helper
+    # raises TypeError on the item assignment. Prism wraps the helper to no-op on a
+    # non-dict. Verify the guard without depending on a live disconnect: just confirm
+    # the wrapped helper tolerates None where the original would crash.
+    from litellm.proxy import common_request_processing as _crp
+    from prism.routing import _install_disconnect_metadata_patch
+
+    _install_disconnect_metadata_patch()  # idempotent
+    fn = _crp._apply_client_disconnect_metadata
+    assert getattr(fn, "_prism_guarded", True)  # patched (or litellm already fixed)
+
+    # A dict is still mutated (real path):
+    d: dict = {}
+    fn(d)
+    assert d.get("client_disconnected") is True
+
+    # The bug: None / a non-dict must NOT raise.
+    fn(None)
+    fn("not-a-dict")
+

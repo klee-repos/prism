@@ -22,7 +22,10 @@ def test_to_litellm_config_shape():
     coder = next(m for m in out["model_list"] if m["model_name"] == "coder")
     assert coder["litellm_params"]["model"] == "openrouter/z-ai/glm-5.2"
     assert coder["litellm_params"]["api_key"] == "os.environ/OPENROUTER_API_KEY"
-    assert out["litellm_settings"]["callbacks"] == "prism_hook.instance"
+    assert out["litellm_settings"]["callbacks"] == ["prism_hook.instance"]
+    # No search section in the default config → no search_tools / interception callback.
+    assert "search_tools" not in out
+    assert "websearch_interception_params" not in out["litellm_settings"]
     # Loopback-only proxy: no master-key gate is emitted.
     assert "general_settings" not in out
 
@@ -136,6 +139,68 @@ def test_mapping_env():
 
 def test_active_key_envs():
     assert c.active_key_envs(base()) == ["OPENROUTER_API_KEY"]
+
+
+def test_active_key_envs_includes_search_key():
+    cfg = base()
+    cfg["search"] = {"provider": "firecrawl", "api_key_env": "FIRECRAWL_API_KEY"}
+    assert "FIRECRAWL_API_KEY" in c.active_key_envs(cfg)
+
+
+def test_search_section_emits_callback_and_search_tools():
+    cfg = base()
+    cfg["search"] = {"provider": "firecrawl", "api_key_env": "FIRECRAWL_API_KEY"}
+    out = c.to_litellm_config(cfg)
+    cb = out["litellm_settings"]["callbacks"]
+    assert "websearch_interception" in cb and "prism_hook.instance" in cb
+    params = out["litellm_settings"]["websearch_interception_params"]
+    # Must explicitly include Prism's providers — None/[] both collapse to bedrock-only
+    # inside litellm's __init__, which would skip GLM-via-OpenRouter.
+    assert "openrouter" in params["enabled_providers"]
+    assert "gemini" in params["enabled_providers"]
+    assert params["search_tool_name"] == "prism-search"
+    assert out["search_tools"][0]["litellm_params"]["search_provider"] == "firecrawl"
+    assert out["search_tools"][0]["litellm_params"]["api_key"] == "os.environ/FIRECRAWL_API_KEY"
+
+
+def test_search_section_supports_firecrawl():
+    # Firecrawl is the documented default. Verify it validates and emits the right slug.
+    cfg = base()
+    cfg["search"] = {"provider": "firecrawl", "api_key_env": "FIRECRAWL_API_KEY"}
+    c.validate(cfg, known_providers=KNOWN)  # must not raise
+    out = c.to_litellm_config(cfg)
+    assert out["search_tools"][0]["litellm_params"]["search_provider"] == "firecrawl"
+
+
+
+def test_search_section_keyless_provider_needs_no_key_env():
+    cfg = base()
+    cfg["search"] = {"provider": "duckduckgo"}
+    c.validate(cfg, known_providers=KNOWN)  # no api_key_env required
+    out = c.to_litellm_config(cfg)
+    assert out["search_tools"][0]["litellm_params"]["search_provider"] == "duckduckgo"
+    assert "api_key" not in out["search_tools"][0]["litellm_params"]
+
+
+def test_search_section_rejects_unknown_provider():
+    cfg = base()
+    cfg["search"] = {"provider": "googly", "api_key_env": "G"}
+    with pytest.raises(c.ConfigError):
+        c.validate(cfg, known_providers=KNOWN)
+
+
+def test_search_section_keyed_provider_needs_api_key_env():
+    cfg = base()
+    cfg["search"] = {"provider": "tavily"}  # missing api_key_env
+    with pytest.raises(c.ConfigError):
+        c.validate(cfg, known_providers=KNOWN)
+
+
+def test_no_search_section_emits_no_search_tools():
+    out = c.to_litellm_config(base())
+    assert "search_tools" not in out
+    assert out["litellm_settings"]["callbacks"] == ["prism_hook.instance"]
+    assert "websearch_interception_params" not in out["litellm_settings"]
 
 
 def test_config_hash_is_stable_and_sensitive():

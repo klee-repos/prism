@@ -29,6 +29,50 @@ MULTIMODAL_TYPES = frozenset(
 
 DEFAULT_MULTIMODAL_ROUTE = "multimodal"
 
+# Anthropic *hosted* (server-side) tool `type` prefixes. These tools are executed
+# on Anthropic's servers, not by the client — Claude Code's built-in WebSearch is
+# sent as ``{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}``.
+# Prism's backends (GLM, Gemini-via-OpenRouter, …) cannot execute them: litellm
+# rewrites a hosted ``web_search_*`` tool to OpenAI's ``{"type": "web_search_preview"}``
+# and forwards it to a model that doesn't support it, the model then emits a malformed
+# tool_call, Claude Code rejects it with InputValidationError, and the request loops
+# forever. Instead of passing the hosted tool through, we *convert* it to litellm's
+# standard callable ``litellm_web_search`` function tool — which the model CAN call,
+# and which litellm's WebSearchInterceptionLogger (registered by Prism when a search
+# provider is configured) intercepts and executes. Matched by prefix so future-dated
+# variants (``web_search_2026…``) are covered without a code change.
+HOSTED_WEB_SEARCH_TYPE_PREFIXES = ("web_search",)
+
+# The standard tool litellm's interception loop recognizes and executes. Mirrors
+# litellm.integrations.websearch_interception.tools.get_litellm_web_search_tool() so
+# the hook is unit-testable without importing litellm.
+LITELLM_WEB_SEARCH_TOOL = {
+    "name": "litellm_web_search",
+    "description": (
+        "Search the web for information. Use this when you need current "
+        "information or answers to questions that require up-to-date data."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The search query to execute"},
+        },
+        "required": ["query"],
+    },
+}
+
+# litellm provider prefixes (the segment before the first ``/`` in a qualified model
+# like ``openrouter/z-ai/glm-5.2``). Used by the websearch follow-up patch to decide
+# whether a model already carries a provider prefix (so we don't double-prepend). A
+# small subset of litellm's LlmProviders — the ones Prism routes to. If a model starts
+# with none of these, it's the bare deployment id (e.g. ``z-ai/glm-5.2``) and needs
+# ``<provider>/`` prepended.
+_LITELLM_PROVIDER_PREFIXES = (
+    "openrouter", "openai", "gemini", "anthropic", "zai", "azure",
+    "bedrock", "vertex_ai", "huggingface", "together_ai", "mistral",
+    "groq", "fireworks_ai", "ai21", "cohere", "replicate", "anyscale",
+)
+
 
 def _content_has_multimodal(content: Any) -> bool:
     """Depth-first scan of a message ``content`` value for any multimodal part.
@@ -60,7 +104,9 @@ def needs_multimodal(messages: Any, system: Any = None) -> bool:
 
 
 class ModalityRouter(CustomLogger):
-    """Reroutes image/file requests to the multimodal route via ``data['model']``."""
+    """Reroutes image/file requests to the multimodal route via ``data['model']``
+    and converts Anthropic-hosted web_search tools into litellm's standard callable
+    ``litellm_web_search`` function tool, so cheap backends can still search."""
 
     def __init__(self) -> None:
         self._fired = False
@@ -68,10 +114,79 @@ class ModalityRouter(CustomLogger):
     def _multimodal_route(self) -> str:
         return os.environ.get("PRISM_MULTIMODAL_ROUTE", DEFAULT_MULTIMODAL_ROUTE)
 
+    @staticmethod
+    def _is_hosted_web_search(tool: Any) -> bool:
+        """True if ``tool`` is an Anthropic-hosted web_search server tool.
+
+        Claude Code sends ``{"type": "web_search_20250305", "name": "web_search", ...}``;
+        the version suffix is date-stamped, so match by prefix.
+        """
+        if not isinstance(tool, dict):
+            return False
+        t = tool.get("type")
+        if isinstance(t, str) and t.startswith(HOSTED_WEB_SEARCH_TYPE_PREFIXES):
+            return True
+        # The Claude Code CLI shape uses ``name="web_search"`` with a versioned type;
+        # a bare ``name`` (no versioned type) is not a hosted tool.
+        return False
+
+    def _web_search_enabled(self) -> bool:
+        """True when Prism's generated config registered a search provider.
+
+        Set by ``cli.build_claude_env`` from ``config.search_enabled``; the hook runs
+        in the litellm subprocess so it reads the flag from the environment, not the
+        Prism config object. When False, hosted web_search tools are stripped (the
+        cheap backends can't execute them) rather than converted to a function tool
+        that would never be served.
+        """
+        return os.environ.get("PRISM_SEARCH") == "1"
+
+    def _convert_hosted_web_search(self, data: dict) -> None:
+        """Handle hosted web_search tools: convert (if search is configured) or strip.
+
+        The hosted tool is server-side (Anthropic runs it); Prism's backends can't.
+        litellm's adapter would otherwise push it to the provider as OpenAI's
+        ``web_search_preview``, which GLM/Gemini-via-OpenRouter ignore → the model
+        emits a malformed tool_call → InputValidationError loop.
+
+        When a search provider is configured, we convert it to litellm's standard
+        ``litellm_web_search`` function tool — the model can call it, and litellm's
+        ``websearch_interception`` callback runs the search via ``litellm.asearch``
+        then re-calls the model with the results. When no search provider is
+        configured, we strip it (the model simply won't call WebSearch) rather than
+        leave a function tool whose results nothing can fulfill.
+        """
+        tools = data.get("tools")
+        if not isinstance(tools, list) or not tools:
+            return
+        if not any(self._is_hosted_web_search(t) for t in tools):
+            return
+
+        if self._web_search_enabled():
+            new_tools: list = []
+            replaced = False
+            for t in tools:
+                if self._is_hosted_web_search(t):
+                    if not replaced:
+                        new_tools.append(dict(LITELLM_WEB_SEARCH_TOOL))
+                        replaced = True
+                    # Drop duplicate hosted web_search entries (one function tool suffices).
+                else:
+                    new_tools.append(t)
+            data["tools"] = new_tools
+        else:
+            kept = [t for t in tools if not self._is_hosted_web_search(t)]
+            if kept:
+                data["tools"] = kept
+            else:
+                del data["tools"]
+                data.pop("tool_choice", None)  # orphaned without any tools
+
     def route(self, data: dict) -> dict:
-        """Pure routing decision — unit-testable without litellm."""
+        """Pure routing + web-search-tool decision — unit-testable without litellm."""
         if needs_multimodal(data.get("messages"), data.get("system")):
             data["model"] = self._multimodal_route()
+        self._convert_hosted_web_search(data)
         return data
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
@@ -79,7 +194,110 @@ class ModalityRouter(CustomLogger):
             self._fired = True
             # Proof marker (lands in the proxy log). Never log request bodies/keys.
             print("prism.hook.fired", file=sys.stderr, flush=True)
+            # When web search is enabled, patch litellm's follow-up model resolution so
+            # the mixed-tool agentic loop (web_search + Bash in one request) can re-call
+            # the model. litellm's _build_anthropic_request_patch reads the bare
+            # deployment model from agentic_loop_params["model"] (e.g. "z-ai/glm-5.2")
+            # but ignores the adjacent "custom_llm_provider" — so the follow-up call
+            # fails with "LLM Provider NOT provided". We qualify the model using the
+            # provider litellm already populated. Idempotent; guarded so a litellm
+            # layout change degrades to the original behavior rather than crashing.
+            _install_websearch_followup_patch()
+            _install_disconnect_metadata_patch()
         return self.route(data)
+
+
+_websearch_patch_installed = False
+
+
+def _install_websearch_followup_patch() -> None:
+    """Qualify the agentic follow-up model with its provider (litellm bug workaround).
+
+    litellm 1.91.0's ``_execute_chat_completion_agentic_plan`` (the mixed-tool websearch
+    agentic path) builds the follow-up model as ``patch.model or model`` then prepends
+    ``custom_llm_provider/`` *only when the model has no* ``/``. OpenRouter model ids
+    contain ``/`` as the *vendor* separator (``z-ai/glm-5.2``), so the check is skipped
+    and the follow-up calls ``litellm.acompletion(model="z-ai/glm-5.2")`` — which has no
+    resolvable provider, raising ``LLM Provider NOT provided``. The correct check is
+    whether the model already starts with ``"<provider>/"``. We wrap the method to apply
+    that. Idempotent + defensive: if litellm's layout moves, the original (buggy)
+    behavior stands rather than crashing the follow-up.
+    """
+    global _websearch_patch_installed
+    if _websearch_patch_installed:
+        return
+    try:
+        from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+    except Exception:  # pragma: no cover
+        return  # litellm not importable (unit tests) → nothing to patch
+
+    target = getattr(BaseLLMHTTPHandler, "_execute_chat_completion_agentic_plan", None)
+    if target is None or getattr(target, "_prism_qualified", False):
+        _websearch_patch_installed = True
+        return
+
+    async def patched(self, plan, model, messages, optional_params, kwargs,
+                      custom_llm_provider, depth, max_loops, fingerprints, fingerprint):
+        # Re-qualify the model litellm's plan resolved (the router left it as the bare
+        # deployment id, e.g. "z-ai/glm-5.2"). Prepend the provider unless the model
+        # already carries it. Mirrors litellm's own intent at line 5221 — the bug is its
+        # `"/" in full_model_name` check, which false-positives on vendor-prefixed ids.
+        patch = plan.request_patch
+        if patch is not None and patch.model:
+            m = patch.model
+            if (custom_llm_provider and
+                    not m.startswith(f"{custom_llm_provider}/") and
+                    not any(m.startswith(p + "/") for p in _LITELLM_PROVIDER_PREFIXES)):
+                plan.request_patch = patch.model_copy(update={
+                    "model": f"{custom_llm_provider}/{m}",
+                })
+        return await target(
+            self, plan, model, messages, optional_params, kwargs,
+            custom_llm_provider, depth, max_loops, fingerprints, fingerprint,
+        )
+
+    patched._prism_qualified = True  # type: ignore[attr-defined]
+    BaseLLMHTTPHandler._execute_chat_completion_agentic_plan = patched  # type: ignore[assignment]
+    _websearch_patch_installed = True
+
+
+_disconnect_patch_installed = False
+
+
+def _install_disconnect_metadata_patch() -> None:
+    """Guard litellm's streaming client-disconnect bookkeeping against a None metadata.
+
+    litellm 1.91.0's ``_record_streaming_client_disconnect_if_needed`` calls
+    ``_apply_client_disconnect_metadata(metadata)`` on several metadata dicts obtained
+    via ``setdefault("metadata", {})``. But a metadata slot can already be present with
+    value ``None`` (some call paths pre-set it to None), and ``setdefault`` then returns
+    that ``None`` without replacing it — so ``target_metadata["client_disconnected"]=True``
+    raises ``TypeError: 'NoneType' object does not support item assignment``. The request
+    has already streamed its 200; this only crashes the post-response cleanup, but it
+    spams the proxy log and can mask real errors. We wrap the helper to no-op (and warn)
+    when handed a non-dict, which is the only behavior change. Idempotent + defensive.
+    """
+    global _disconnect_patch_installed
+    if _disconnect_patch_installed:
+        return
+    try:
+        from litellm.proxy import common_request_processing as _crp
+    except Exception:  # pragma: no cover
+        return  # litellm not importable (unit tests) → nothing to patch
+    target = getattr(_crp, "_apply_client_disconnect_metadata", None)
+    if target is None or getattr(target, "_prism_guarded", False):
+        _disconnect_patch_installed = True
+        return
+
+    def guarded(target_metadata):  # type: ignore[no-untyped-def]
+        if not isinstance(target_metadata, dict):
+            # Don't crash the cleanup path; litellm's own contract assumes a dict here.
+            return
+        return target(target_metadata)
+
+    guarded._prism_guarded = True  # type: ignore[attr-defined]
+    _crp._apply_client_disconnect_metadata = guarded  # type: ignore[assignment]
+    _disconnect_patch_installed = True
 
 
 # The instance litellm loads via `litellm_settings.callbacks: prism_hook.instance`.

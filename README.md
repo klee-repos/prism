@@ -33,8 +33,8 @@ on the cheap model. One tool, no code changes to your projects.
   Anthropic, Azure, Bedrock, and more.
 - **Runs only on your machine.** The proxy talks to `127.0.0.1` (your loopback address), starts
   when you start `prism`, and stops when you stop. No background daemon, no keys saved to disk.
-- **Honest about limits.** Video isn't supported; PDFs are best-effort. Documented below, not
-  hidden.
+- **Honest about limits.** Video isn't supported; PDFs are best-effort. Web search
+  needs a one-time provider key (below). Documented, not hidden.
 
 ## Install
 
@@ -105,6 +105,35 @@ Before each request is sent, Prism looks at it: if it contains an image or file 
 inside a tool's output), that request goes to the `multimodal` model; otherwise it stays on
 whichever model Claude Code picked. You only pay the vision-model price on requests that actually
 have a picture or file.
+
+## Web search
+
+Claude Code's built-in WebSearch is a hosted Anthropic tool — Anthropic's servers run it,
+not your machine. GLM, Gemini, and the other cheap backends can't execute it, so by default
+Prism strips it (the model simply won't call WebSearch; it can still fetch URLs you name
+with WebFetch).
+
+To keep WebSearch working on the cheap coder model, add a `search` section to
+`~/.prism/config.yaml`:
+
+```yaml
+search:
+  provider: firecrawl              # litellm search slug (firecrawl, tavily, perplexity,
+  api_key_env: FIRECRAWL_API_KEY  #   serper, exa_ai, brave, … keyless: duckduckgo)
+```
+
+Then export the key:
+
+```sh
+export FIRECRAWL_API_KEY=fc-...
+```
+
+With a provider wired, Prism converts WebSearch into a plain function tool the model can
+call, and litellm runs the search via your provider and feeds the results back to the
+model — so you stay on the cheap model instead of paying for a search-capable one. Get a
+key from Firecrawl's dashboard (free tier available; see firecrawl.dev). Keyless
+`duckduckgo` works but returns very few results — fine for trivial lookups, not for real
+research.
 
 ## Develop
 

@@ -65,6 +65,11 @@ def build_claude_env(base_env: dict, base_url: str, cfg: dict) -> dict:
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = LOCAL_AUTH_TOKEN
     env.update(cfgmod.mapping_env(cfg))
+    # Tell the routing hook (running in the litellm subprocess) whether to convert
+    # hosted web_search tools into a callable function tool (search provider wired)
+    # or strip them. The env is read by prism.routing.ModalityRouter._web_search_enabled.
+    if cfgmod.search_enabled(cfg):
+        env["PRISM_SEARCH"] = "1"
     return env
 
 
@@ -112,6 +117,10 @@ def cmd_setup(_args: list[str]) -> int:
         print("\nNext step — export your provider key(s):")
         for k in missing:
             print(f"  export {k}=...")
+    if not cfgmod.search_enabled(cfg):
+        print("\nWeb search is off (no `search:` section). Claude Code's WebSearch will be")
+        print("stripped — the cheap backends can't run it. To keep it working, add a")
+        print("`search:` provider to the config (see README → Web search).")
     print("\nThen just run:  prism            (or: prism -p 'hello')")
     return 0
 
@@ -149,6 +158,8 @@ def cmd_status(_args: list[str]) -> int:
             print(f"config_hash: {cfgmod.config_hash(cfg)}")
             for role in cfgmod.REQUIRED_ROLES:
                 print(f"  {role:11s} -> {cfgmod._route_model_string(cfg, role)}")
+            search = (cfg.get("search") or {}).get("provider")
+            print(f"  web search -> {search or 'off (WebSearch stripped)'}")
         except cfgmod.ConfigError as e:
             print(f"config error: {e}")
     else:
@@ -208,6 +219,11 @@ def run_passthrough(forward_args: list[str]) -> int:
             )
 
     _warn_env_override(dict(os.environ))
+    # The litellm subprocess inherits os.environ at spawn time (below), so the
+    # search-enabled flag must be set on the process env BEFORE proxymod.start —
+    # build_claude_env runs too late for the child to inherit it.
+    if cfgmod.search_enabled(cfg):
+        os.environ["PRISM_SEARCH"] = "1"
     proxy = proxymod.start(cfg)
     try:
         env = build_claude_env(dict(os.environ), proxy.base_url, cfg)

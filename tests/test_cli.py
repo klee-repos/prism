@@ -48,6 +48,13 @@ def test_build_claude_env_sets_all_expected():
     assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "coder"
     assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "background"
     assert env["PATH"] == "/x"  # existing env preserved
+    assert "PRISM_SEARCH" not in env  # no search section → flag unset
+
+
+def test_build_claude_env_sets_prism_search_when_configured():
+    cfg = {"mapping": {"opus": "coder"}, "search": {"provider": "tavily", "api_key_env": "TAVILY_API_KEY"}}
+    env = cli.build_claude_env({}, "http://127.0.0.1:5000", cfg)
+    assert env["PRISM_SEARCH"] == "1"
 
 
 def test_exec_claude_forwards_args_verbatim(monkeypatch):

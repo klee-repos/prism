@@ -22,6 +22,26 @@ REQUIRED_ROLES = ("coder", "background", "multimodal")
 MAPPING_SLOTS = ("opus", "sonnet", "haiku")
 
 HOOK_REF = "prism_hook.instance"
+WEBSEARCH_CALLBACK = "websearch_interception"
+WEBSEARCH_SEARCH_TOOL_NAME = "prism-search"
+
+# litellm LlmProviders slugs Prism can route to. The websearch_interception callback
+# gate skips any provider not in enabled_providers (None/[] both collapse to
+# bedrock-only inside its __init__, which would skip our backends), so list them
+# explicitly. Keep ZAI for direct z.ai routing; add others here as Prism supports them.
+WEBSEARCH_ENABLED_PROVIDERS = (
+    "openrouter", "openai", "gemini", "anthropic", "zai", "azure", "bedrock", "vertex_ai",
+)
+
+# litellm SearchProviders slugs that take an API key. Used to validate `search.provider`.
+# (DuckDuckGo is keyless in litellm but returns ~0 results for real queries, so we
+# still accept it but warn; see cmd_doctor.)
+KEYED_SEARCH_PROVIDERS = {
+    "tavily", "perplexity", "serper", "exa_ai", "brave",
+    "firecrawl", "you_com", "searchapi", "linkup", "google_pse",
+    "dataforseo", "apiserpent", "tinyfish", "parallel_ai",
+}
+KEYLESS_SEARCH_PROVIDERS = {"duckduckgo", "searxng", "fastcrw"}
 
 
 def prism_home() -> Path:
@@ -121,6 +141,45 @@ def validate(cfg: dict, known_providers: set[str] | None = None) -> None:
         if target not in routes:
             raise ConfigError(f"mapping.{slot} → '{target}' is not a defined route.")
 
+    _validate_search(cfg)
+
+
+def _validate_search(cfg: dict) -> None:
+    """Validate the optional `search` section (enables Claude Code's WebSearch).
+
+    If absent, Prism strips hosted web_search tools (the cheap backends can't run
+    them). If present, Prism converts them to litellm's callable ``litellm_web_search``
+    function tool and litellm's websearch_interception callback executes the search
+    via ``litellm.asearch``.
+
+    Shape::
+
+        search:
+          provider: tavily            # a litellm SearchProviders slug
+          api_key_env: TAVILY_API_KEY # env var holding the key (omit for keyless)
+          # api_base: https://...     # optional override
+    """
+    search = cfg.get("search")
+    if search is None:
+        return
+    if not isinstance(search, dict):
+        raise ConfigError("`search` must be a mapping (or omitted to disable web search).")
+    provider = search.get("provider")
+    if not isinstance(provider, str) or not provider:
+        raise ConfigError("`search.provider` is required (a litellm search provider slug).")
+    known = KEYED_SEARCH_PROVIDERS | KEYLESS_SEARCH_PROVIDERS
+    if provider not in known:
+        sample = ", ".join(sorted(known)[:12])
+        raise ConfigError(
+            f"search.provider '{provider}' is not a known litellm search provider "
+            f"(e.g. {sample}, …). See https://docs.litellm.ai/docs/search."
+        )
+    if provider in KEYED_SEARCH_PROVIDERS and "api_key_env" not in search:
+        raise ConfigError(
+            f"search.provider '{provider}' needs `api_key_env` (the env var holding its key). "
+            "Keyless options: duckduckgo, searxng, fastcrw."
+        )
+
 
 def _litellm_provider_list() -> set[str]:
     try:
@@ -151,6 +210,20 @@ def _route_params(cfg: dict, role: str) -> dict:
     return params
 
 
+def _search_params(cfg: dict) -> dict | None:
+    """litellm_params for the search tool, or None if web search is unconfigured."""
+    search = cfg.get("search") or {}
+    provider = search.get("provider")
+    if not provider:
+        return None
+    params: dict[str, Any] = {"search_provider": provider}
+    if search.get("api_key_env"):
+        params["api_key"] = f"os.environ/{search['api_key_env']}"
+    if search.get("api_base"):
+        params["api_base"] = search["api_base"]
+    return params
+
+
 def to_litellm_config(cfg: dict) -> dict:
     """Generate the LiteLLM proxy config dict from the friendly Prism config."""
     model_list = []
@@ -163,10 +236,31 @@ def to_litellm_config(cfg: dict) -> dict:
     # not gate requests on a key. Claude Code, when signed in to a Claude subscription,
     # forwards its own OAuth token regardless of env vars — a mandatory proxy key would
     # reject that token and break the whole point. Loopback binding is the trust boundary.
-    return {
-        "model_list": model_list,
-        "litellm_settings": {"callbacks": HOOK_REF},
-    }
+    litellm_settings: dict[str, Any] = {"callbacks": [HOOK_REF]}
+    out: dict[str, Any] = {"model_list": model_list, "litellm_settings": litellm_settings}
+
+    search_params = _search_params(cfg)
+    if search_params is not None:
+        # Register litellm's websearch_interception callback (instantiated by name) and
+        # a search_tools entry the callback resolves via litellm.asearch(). The hook
+        # (prism.routing) converts Claude Code's hosted web_search tool into the callable
+        # litellm_web_search function tool; this callback runs the search when the model
+        # calls it, then re-calls the model with the results — keeping you on the cheap
+        # coder model instead of routing web-search turns to the multimodal route.
+        litellm_settings["callbacks"] = [HOOK_REF, WEBSEARCH_CALLBACK]
+        litellm_settings["websearch_interception_params"] = {
+            # The gate skips any provider NOT in this list. None/[] both default to
+            # bedrock-only (litellm's __init__ rewrites None → [bedrock]), which would
+            # skip every Prism backend. List the litellm provider slugs Prism can route
+            # to so GLM-via-OpenRouter, Gemini, etc. are all intercepted.
+            "enabled_providers": list(WEBSEARCH_ENABLED_PROVIDERS),
+            "search_tool_name": WEBSEARCH_SEARCH_TOOL_NAME,
+        }
+        out["search_tools"] = [{
+            "search_tool_name": WEBSEARCH_SEARCH_TOOL_NAME,
+            "litellm_params": search_params,
+        }]
+    return out
 
 
 def config_hash(cfg: dict) -> str:
@@ -199,4 +293,14 @@ def active_key_envs(cfg: dict) -> list[str]:
         env = prov.get("api_key_env")
         if env and env not in envs:
             envs.append(env)
+    # Web search key (if configured) — the proxy won't be able to run searches without it.
+    search = cfg.get("search") or {}
+    search_env = search.get("api_key_env")
+    if search_env and search_env not in envs:
+        envs.append(search_env)
     return envs
+
+
+def search_enabled(cfg: dict) -> bool:
+    """True if a web-search provider is configured (so the hook converts, not strips)."""
+    return bool((cfg.get("search") or {}).get("provider"))

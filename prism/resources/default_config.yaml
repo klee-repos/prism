@@ -47,6 +47,19 @@ mapping:
   sonnet: coder
   haiku: background
 
+# ── Web search (optional) ─────────────────────────────────────────────────────────
+# Claude Code's built-in WebSearch is a hosted Anthropic tool that GLM/Gemini can't
+# run — without a search provider wired, Prism strips it (the model just won't call
+# it). To keep WebSearch working on the cheap coder model, configure a search
+# provider: Prism converts the tool to a callable function, and litellm's
+# websearch_interception callback runs the search via `litellm.asearch` then feeds
+# the results back to the model. Get a key from the provider's dashboard.
+#
+# search:
+#   provider: firecrawl          # litellm search slug (firecrawl, tavily, perplexity,
+#                                #   serper, exa_ai, brave, … keyless: duckduckgo)
+#   api_key_env: FIRECRAWL_API_KEY  # env var holding the key (omit for keyless)
+
 # ── Example: swap the coder to GLM direct from z.ai (no code change) ──────────────
 # providers:
 #   zai:
