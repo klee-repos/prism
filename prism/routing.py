@@ -61,19 +61,6 @@ LITELLM_WEB_SEARCH_TOOL = {
     },
 }
 
-# litellm provider prefixes (the segment before the first ``/`` in a qualified model
-# like ``openrouter/z-ai/glm-5.2``). Used by the websearch follow-up patch to decide
-# whether a model already carries a provider prefix (so we don't double-prepend). A
-# small subset of litellm's LlmProviders — the ones Prism routes to. If a model starts
-# with none of these, it's the bare deployment id (e.g. ``z-ai/glm-5.2``) and needs
-# ``<provider>/`` prepended.
-_LITELLM_PROVIDER_PREFIXES = (
-    "openrouter", "openai", "gemini", "anthropic", "zai", "azure",
-    "bedrock", "vertex_ai", "huggingface", "together_ai", "mistral",
-    "groq", "fireworks_ai", "ai21", "cohere", "replicate", "anyscale",
-)
-
-
 def _content_has_multimodal(content: Any) -> bool:
     """Depth-first scan of a message ``content`` value for any multimodal part.
 
@@ -207,6 +194,28 @@ class ModalityRouter(CustomLogger):
         return self.route(data)
 
 
+def _qualify_followup_model(model: str, custom_llm_provider: str) -> str | None:
+    """Provider-qualify an agentic follow-up model, or ``None`` if already qualified.
+
+    litellm resolves the follow-up ``patch.model`` to the bare deployment id and, because
+    it contains a ``/`` *vendor* separator, skips prepending the provider. That leaves the
+    follow-up model either provider-less (``z-ai/glm-5.2`` → ``LLM Provider NOT provided``)
+    or resolvable to the WRONG provider (``openai/gpt-4o-mini`` → litellm dispatches to
+    OpenAI directly instead of the configured OpenRouter deployment). The only reliable
+    signal for "which provider serves *this* call" is the ``custom_llm_provider`` litellm
+    already populated — not the vendor segment of the model id, which for OpenRouter
+    (``openai/…``, ``anthropic/…``, ``cohere/…``) collides with real provider names.
+
+    So prepend ``{custom_llm_provider}/`` unless the model is already qualified with it.
+    Returns the qualified model, or ``None`` to leave it unchanged.
+    """
+    if not model or not custom_llm_provider:
+        return None
+    if model.startswith(f"{custom_llm_provider}/"):
+        return None
+    return f"{custom_llm_provider}/{model}"
+
+
 _websearch_patch_installed = False
 
 
@@ -218,10 +227,10 @@ def _install_websearch_followup_patch() -> None:
     ``custom_llm_provider/`` *only when the model has no* ``/``. OpenRouter model ids
     contain ``/`` as the *vendor* separator (``z-ai/glm-5.2``), so the check is skipped
     and the follow-up calls ``litellm.acompletion(model="z-ai/glm-5.2")`` — which has no
-    resolvable provider, raising ``LLM Provider NOT provided``. The correct check is
-    whether the model already starts with ``"<provider>/"``. We wrap the method to apply
-    that. Idempotent + defensive: if litellm's layout moves, the original (buggy)
-    behavior stands rather than crashing the follow-up.
+    resolvable provider, raising ``LLM Provider NOT provided``. We wrap the method to
+    re-qualify the model against the ``custom_llm_provider`` litellm already populated
+    (see ``_qualify_followup_model``). Idempotent + defensive: if litellm's layout moves,
+    the original (buggy) behavior stands rather than crashing the follow-up.
     """
     global _websearch_patch_installed
     if _websearch_patch_installed:
@@ -239,18 +248,15 @@ def _install_websearch_followup_patch() -> None:
     async def patched(self, plan, model, messages, optional_params, kwargs,
                       custom_llm_provider, depth, max_loops, fingerprints, fingerprint):
         # Re-qualify the model litellm's plan resolved (the router left it as the bare
-        # deployment id, e.g. "z-ai/glm-5.2"). Prepend the provider unless the model
-        # already carries it. Mirrors litellm's own intent at line 5221 — the bug is its
-        # `"/" in full_model_name` check, which false-positives on vendor-prefixed ids.
+        # deployment id, e.g. "z-ai/glm-5.2" or "openai/gpt-4o-mini"). Prepend the
+        # provider litellm already populated unless the model already carries it. Mirrors
+        # litellm's own intent at line 5221 — the bug is its `"/" in full_model_name`
+        # check, which false-positives on any vendor-prefixed id.
         patch = plan.request_patch
         if patch is not None and patch.model:
-            m = patch.model
-            if (custom_llm_provider and
-                    not m.startswith(f"{custom_llm_provider}/") and
-                    not any(m.startswith(p + "/") for p in _LITELLM_PROVIDER_PREFIXES)):
-                plan.request_patch = patch.model_copy(update={
-                    "model": f"{custom_llm_provider}/{m}",
-                })
+            qualified = _qualify_followup_model(patch.model, custom_llm_provider)
+            if qualified is not None:
+                plan.request_patch = patch.model_copy(update={"model": qualified})
         return await target(
             self, plan, model, messages, optional_params, kwargs,
             custom_llm_provider, depth, max_loops, fingerprints, fingerprint,

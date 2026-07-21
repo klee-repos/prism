@@ -530,3 +530,127 @@ def test_disconnect_metadata_patch_handles_none():
     # The bug: None / a non-dict must NOT raise.
     fn(None)
     fn("not-a-dict")
+
+
+def test_mixed_tool_websearch_loop_qualifies_openai_vendored_model(tmp_path, monkeypatch):
+    # Regression for the latent follow-up-qualification bug: a model whose OpenRouter
+    # *vendor* segment collides with a real litellm provider name ("openai/gpt-4o-mini",
+    # "anthropic/…", "cohere/…"). litellm leaves the mixed-tool follow-up model as the bare
+    # "openai/gpt-4o-mini"; the old guard saw `.startswith("openai/")` and skipped
+    # prepending the provider, so the synthesis turn resolved provider "openai" and hit
+    # OpenAI directly instead of the configured OpenRouter deployment. The tell is the
+    # model the upstream receives on turn 2: OpenRouter forwards the vendor-prefixed slug
+    # verbatim ("openai/gpt-4o-mini"), whereas the OpenAI provider transform strips it to
+    # the bare "gpt-4o-mini". Mirrors test_mixed_tool_websearch_loop_completes (which
+    # must NOT regress) but with the vendor-colliding model.
+    monkeypatch.setenv("PRISM_HOME", str(tmp_path / ".prism"))
+    monkeypatch.setenv("PRISM_TEST_KEY", "sk-dummy-not-real")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-dummy-not-real")
+    monkeypatch.setenv("PRISM_SEARCH", "1")
+
+    import json as _json
+    llm_calls = {"n": 0}
+    seen_models: list = []  # the `model` field of each request the upstream receives, in order
+
+    class LLMHandler(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def do_GET(self):
+            self._json({"data": [], "object": "list"})
+
+        def do_POST(self):
+            llm_calls["n"] += 1
+            length = int(self.headers.get("Content-Length", 0))
+            payload = _json.loads(self.rfile.read(length)) if length else {}
+            seen_models.append(payload.get("model"))
+            if llm_calls["n"] == 1:
+                resp = {"id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                        "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                     "message": {"role": "assistant", "content": None,
+                                                 "tool_calls": [{"id": "c1", "type": "function",
+                                                                 "function": {"name": "litellm_web_search",
+                                                                              "arguments": _json.dumps({"query": "maestro yaml"})}}]}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+            else:
+                resp = {"id": "y", "object": "chat.completion", "created": 0, "model": "m",
+                        "choices": [{"index": 0, "finish_reason": "stop",
+                                     "message": {"role": "assistant", "content": "synthesized answer"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+            self._json(resp)
+
+        def _json(self, obj):
+            data = _json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    llm_srv = ThreadingHTTPServer(("127.0.0.1", 0), LLMHandler)
+    llm_port = llm_srv.server_address[1]
+    threading.Thread(target=llm_srv.serve_forever, daemon=True).start()
+
+    # Stub litellm.asearch so the search runs without a real Firecrawl key/network.
+    import litellm
+
+    async def fake_asearch(**kwargs):
+        from litellm.types.utils import SearchResponse, SearchAPIResult
+        return SearchResponse(results=[SearchAPIResult(
+            title="Maestro YAML Guide", url="https://maestro.mobile/yaml",
+            content="flow: and commands: are top-level keys", score=0.9,
+        )])
+    monkeypatch.setattr(litellm, "asearch", fake_asearch)
+
+    cfg = {
+        "schema_version": 1,
+        "providers": {"mock": {
+            "type": "openrouter", "api_key_env": "PRISM_TEST_KEY",
+            "api_base": f"http://127.0.0.1:{llm_port}",
+        }},
+        "routes": {
+            # Vendor segment "openai" collides with the litellm provider name — the bug.
+            "coder": {"provider": "mock", "model": "openai/gpt-4o-mini"},
+            "background": {"provider": "mock", "model": "openai/gpt-4o-mini"},
+            "multimodal": {"provider": "mock", "model": "google/gemini-2.5-flash"},
+        },
+        "mapping": {"opus": "coder", "sonnet": "coder", "haiku": "background"},
+        "search": {"provider": "firecrawl", "api_key_env": "FIRECRAWL_API_KEY"},
+    }
+    home = cfgmod.prism_home()
+    home.mkdir(parents=True, exist_ok=True)
+    cfgmod.config_path().write_text(yaml.safe_dump(cfg))
+    cli._write_hook_shim()
+    proxy = proxymod.start(cfg)
+    try:
+        r = httpx.post(
+            f"{proxy.base_url}/v1/messages",
+            headers={"content-type": "application/json"},
+            json={"model": "coder", "max_tokens": 200,
+                  "messages": [{"role": "user", "content": "search for maestro yaml syntax"}],
+                  "tools": [
+                      {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                      {"name": "Bash", "description": "x",
+                       "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}},
+                  ]},
+            timeout=60.0,
+        )
+    finally:
+        proxy.stop()
+        llm_srv.shutdown()
+
+    assert r.status_code == 200, r.text
+    # The loop must reach the follow-up synthesis call…
+    assert llm_calls["n"] >= 2, (
+        f"mixed-tool agentic loop did not reach the follow-up call "
+        f"(only {llm_calls['n']} LLM call(s), models={seen_models})"
+    )
+    # …and, crucially, that follow-up must go through OpenRouter (provider-qualified to
+    # "openrouter/openai/gpt-4o-mini"), which forwards the vendor-prefixed slug verbatim.
+    # If the guard regresses, the follow-up resolves provider "openai" and the OpenAI
+    # transform strips the prefix to "gpt-4o-mini" — hitting OpenAI directly.
+    assert seen_models[-1] == "openai/gpt-4o-mini", (
+        f"mixed-tool follow-up was not routed through OpenRouter — upstream saw "
+        f"model={seen_models[-1]!r} (expected 'openai/gpt-4o-mini'; a bare 'gpt-4o-mini' "
+        f"means the OpenAI provider path was taken). Full sequence: {seen_models}"
+    )
+

@@ -135,19 +135,37 @@ def test_duplicate_hosted_web_search_becomes_single_function_tool(monkeypatch):
 
 # ── mixed-tool agentic follow-up model qualification (litellm bug workaround) ─────
 
-def test_provider_prefix_list_treats_vendor_slash_as_unqualified():
+def test_qualify_followup_prepends_provider_to_vendor_prefixed_model():
     # The whole reason the mixed-tool follow-up broke: litellm's `"/" in model` check
     # sees "z-ai/glm-5.2" (vendor/model), assumes it's already provider-qualified, and
-    # skips prepending "openrouter/" — so the follow-up can't resolve a provider. Our
-    # list of known provider prefixes must NOT match "z-ai/...", so the patch prepends.
-    from prism.routing import _LITELLM_PROVIDER_PREFIXES
-    bare = "z-ai/glm-5.2"
-    assert not any(bare.startswith(p + "/") for p in _LITELLM_PROVIDER_PREFIXES), (
-        f"'z-ai/glm-5.2' must be treated as bare (vendor-prefixed), not provider-qualified"
-    )
-    # An already-qualified model must be left alone:
-    qualified = "openrouter/z-ai/glm-5.2"
-    assert any(qualified.startswith(p + "/") for p in _LITELLM_PROVIDER_PREFIXES)
+    # skips prepending "openrouter/" — so the follow-up can't resolve a provider. The
+    # patch must qualify it against the provider litellm already populated.
+    from prism.routing import _qualify_followup_model
+    assert _qualify_followup_model("z-ai/glm-5.2", "openrouter") == "openrouter/z-ai/glm-5.2"
+
+
+def test_qualify_followup_prepends_provider_to_openai_vendor_segment():
+    # The latent bug the old slug-list check masked: "openai/gpt-4o-mini" is an OpenRouter
+    # *vendor* segment, not the openai provider. The slug list treated it as already
+    # qualified → the follow-up hit OpenAI directly. Qualifying against custom_llm_provider
+    # correctly routes it back through OpenRouter.
+    from prism.routing import _qualify_followup_model
+    assert (_qualify_followup_model("openai/gpt-4o-mini", "openrouter")
+            == "openrouter/openai/gpt-4o-mini")
+    # Same for anthropic/cohere vendor segments that also collide with provider names.
+    assert (_qualify_followup_model("anthropic/claude-3.5-sonnet", "openrouter")
+            == "openrouter/anthropic/claude-3.5-sonnet")
+
+
+def test_qualify_followup_leaves_already_qualified_model_untouched():
+    # A model already carrying its call's provider must not be double-prefixed.
+    from prism.routing import _qualify_followup_model
+    assert _qualify_followup_model("openrouter/z-ai/glm-5.2", "openrouter") is None
+    # When the provider genuinely IS openai, an "openai/..." model is already qualified.
+    assert _qualify_followup_model("openai/gpt-4o-mini", "openai") is None
+    # Missing provider or model → nothing to do (defensive, no crash).
+    assert _qualify_followup_model("z-ai/glm-5.2", "") is None
+    assert _qualify_followup_model("", "openrouter") is None
 
 
 def test_hosted_tool_future_version_prefix_matches(monkeypatch):
