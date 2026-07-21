@@ -57,47 +57,71 @@ prism --model opus --dangerously-skip-permissions
 prism --resume
 ```
 
-Only three words belong to Prism itself: `setup`, `status`, `doctor`. If you ever want to send one
-of those words to `claude` as a prompt instead, write `prism -- setup`.
+Only four words belong to Prism itself: `setup`, `status`, `doctor`, `profile`. If you ever want to
+send one of those words to `claude` as a prompt instead, write `prism -- setup`.
 
 | Command | What it does |
 | --- | --- |
 | `prism setup` | Create `~/.prism/` and write a default config. Safe to run again. |
-| `prism status` | Show which models your routes point to, plus a config hash. |
+| `prism status` | Show the active profile and which models your routes point to, plus a config hash. |
 | `prism doctor` | Check that litellm, your config, your keys, and `claude` are all good. |
+| `prism profile` | List your profiles (marks the active one). `prism profile <name>` switches. |
 
 ## Pick your models (edit one file)
 
-Everything lives in `~/.prism/config.yaml`. To change a model, just edit that file. The `type`
-field under each provider is what decides which service to call.
+Everything lives in `~/.prism/config.yaml`. A **profile** is a named set of routes;
+`active_profile` picks the one in use. The default config ships two, so you can switch with a
+single word — either edit `active_profile:` by hand, or run `prism profile <name>`:
 
 ```yaml
 schema_version: 1
+active_profile: glm          # ← the one word that switches everything (glm | k3)
+
 providers:
-  openrouter:
-    type: openrouter
-    api_key_env: OPENROUTER_API_KEY
-routes:
-  coder:      { provider: openrouter, model: z-ai/glm-5.2 }        # text and code
-  background: { provider: openrouter, model: z-ai/glm-4.7-flash }   # cheap background tasks
-  multimodal: { provider: openrouter, model: google/gemini-2.5-flash }  # images and files
-mapping:
-  opus: coder
-  sonnet: coder
-  haiku: background
+  openrouter: { type: openrouter, api_key_env: OPENROUTER_API_KEY }
+
+profiles:
+  glm:   # GLM for text/code + Google Gemini for images (two specialized models)
+    coder:      { provider: openrouter, model: z-ai/glm-5.2 }
+    background: { provider: openrouter, model: z-ai/glm-4.7-flash }
+    multimodal: { provider: openrouter, model: google/gemini-2.5-flash }
+  k3:    # Kimi K3 — one model for BOTH text and images
+    coder:      { provider: openrouter, model: moonshotai/kimi-k3 }
+    background: { provider: openrouter, model: z-ai/glm-4.7-flash }   # stays cheap
+    multimodal: { provider: openrouter, model: moonshotai/kimi-k3 }
+
+mapping: { opus: coder, sonnet: coder, haiku: background }
 ```
 
-**Use GLM directly from z.ai** (no middleman):
+### Try Kimi K3, switch back to GLM + Gemini
+
+Kimi K3 handles both text and images, so its profile points **both** the `coder` and
+`multimodal` routes at it — no separate vision model needed:
+
+```sh
+prism profile k3     # use Kimi K3 for text and images
+prism profile glm    # back to GLM (text) + Gemini (vision)
+prism profile        # list profiles; the active one is marked with *
+```
+
+Switching rewrites only the `active_profile:` line (your comments and formatting are kept).
+Two notes on the K3 profile: it keeps the cheap `background` route on GLM-flash (K3 is pricier),
+and its routes carry no `quantizations` pin because K3's OpenRouter endpoint is served at int4 —
+pinning FP8-or-better (like the GLM route does) would leave it with no provider to run on.
+
+**Use GLM directly from z.ai** (no middleman) — add a provider and point a profile's route at it:
 
 ```yaml
 providers:
   zai: { type: zai, api_key_env: ZAI_API_KEY }
-routes:
-  coder: { provider: zai, model: glm-5.2 }
+profiles:
+  glm:
+    coder: { provider: zai, model: glm-5.2 }
 ```
 
 Other `type` values: `openai`, `gemini`, `anthropic`, `azure`, `bedrock`, and more. Direct
 providers use plain model ids; OpenRouter ids carry a vendor prefix (like `z-ai/` or `google/`).
+Older configs that use a single top-level `routes:` block (no profiles) still work unchanged.
 
 ## How routing works
 

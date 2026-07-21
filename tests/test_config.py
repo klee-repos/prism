@@ -39,7 +39,7 @@ def test_wildcard_route_targets_coder_model():
 def test_zai_direct_swap_uses_native_slug_no_api_base():
     cfg = base()
     cfg["providers"]["zai"] = {"type": "zai", "api_key_env": "ZAI_API_KEY"}
-    cfg["routes"]["coder"] = {"provider": "zai", "model": "glm-5.2"}
+    c.resolved_routes(cfg)["coder"] = {"provider": "zai", "model": "glm-5.2"}
     coder = next(m for m in c.to_litellm_config(cfg)["model_list"] if m["model_name"] == "coder")
     assert coder["litellm_params"]["model"] == "zai/glm-5.2"
     assert "api_base" not in coder["litellm_params"]
@@ -76,14 +76,14 @@ def test_wildcard_route_inherits_coder_extra_body():
 
 def test_route_without_extra_body_omits_the_key():
     cfg = base()
-    del cfg["routes"]["coder"]["extra_body"]
+    del c.resolved_routes(cfg)["coder"]["extra_body"]
     coder = next(m for m in c.to_litellm_config(cfg)["model_list"] if m["model_name"] == "coder")
     assert "extra_body" not in coder["litellm_params"]
 
 
 def test_validate_rejects_non_mapping_extra_body():
     cfg = base()
-    cfg["routes"]["coder"]["extra_body"] = ["not", "a", "mapping"]
+    c.resolved_routes(cfg)["coder"]["extra_body"] = ["not", "a", "mapping"]
     with pytest.raises(c.ConfigError):
         c.validate(cfg, known_providers=KNOWN)
 
@@ -97,7 +97,7 @@ def test_validate_rejects_unknown_provider_type():
 
 def test_validate_rejects_dangling_provider_ref():
     cfg = base()
-    cfg["routes"]["coder"]["provider"] = "ghost"
+    c.resolved_routes(cfg)["coder"]["provider"] = "ghost"
     with pytest.raises(c.ConfigError):
         c.validate(cfg, known_providers=KNOWN)
 
@@ -111,7 +111,7 @@ def test_validate_rejects_bad_mapping_target():
 
 def test_validate_rejects_missing_role():
     cfg = base()
-    del cfg["routes"]["multimodal"]
+    del c.resolved_routes(cfg)["multimodal"]
     with pytest.raises(c.ConfigError):
         c.validate(cfg, known_providers=KNOWN)
 
@@ -207,5 +207,162 @@ def test_config_hash_is_stable_and_sensitive():
     cfg = base()
     h1 = c.config_hash(cfg)
     assert h1 == c.config_hash(c.default_config())
-    cfg["routes"]["coder"]["model"] = "z-ai/glm-5"
+    c.resolved_routes(cfg)["coder"]["model"] = "z-ai/glm-5"
     assert c.config_hash(cfg) != h1
+    # An active_profile flip also changes the (display-only) hash.
+    cfg2 = base()
+    cfg2["active_profile"] = "k3"
+    assert c.config_hash(cfg2) != h1
+
+
+# ── profiles (named route bundles + one-word switch) ────────────────────────────────
+
+def legacy_config():
+    """A pre-profiles config: a single top-level `routes` block, no profiles. Must keep
+    working unchanged (the user's existing ~/.prism/config.yaml has this shape)."""
+    return {
+        "schema_version": 1,
+        "providers": {"openrouter": {"type": "openrouter", "api_key_env": "OPENROUTER_API_KEY"}},
+        "routes": {
+            "coder": {"provider": "openrouter", "model": "z-ai/glm-5.2"},
+            "background": {"provider": "openrouter", "model": "z-ai/glm-4.7-flash"},
+            "multimodal": {"provider": "openrouter", "model": "google/gemini-2.5-flash"},
+        },
+        "mapping": {"opus": "coder", "sonnet": "coder", "haiku": "background"},
+    }
+
+
+def test_default_config_is_profiles_shaped_active_glm():
+    cfg = base()
+    assert cfg["active_profile"] == "glm"
+    assert set(cfg["profiles"]) == {"glm", "k3"}
+    assert "routes" not in cfg  # profiles config carries no top-level routes
+
+
+def test_resolved_routes_returns_active_profile_live_reference():
+    cfg = base()
+    assert c.resolved_routes(cfg) is cfg["profiles"]["glm"]  # live reference, not a copy
+    c.resolved_routes(cfg)["coder"]["model"] = "z-ai/changed"
+    coder = next(m for m in c.to_litellm_config(cfg)["model_list"] if m["model_name"] == "coder")
+    assert coder["litellm_params"]["model"] == "openrouter/z-ai/changed"
+
+
+def test_resolved_routes_legacy_fallback():
+    cfg = legacy_config()
+    assert c.resolved_routes(cfg) is cfg["routes"]
+
+
+def test_resolved_routes_raises_configerror_not_keyerror_on_unknown_active():
+    cfg = base()
+    cfg["active_profile"] = "nope"
+    # A raw KeyError here would crash the un-validated `prism status`; must be ConfigError.
+    with pytest.raises(c.ConfigError):
+        c.resolved_routes(cfg)
+
+
+def test_k3_profile_kimi_for_text_and_vision_with_no_quant_pin():
+    cfg = base()
+    cfg["active_profile"] = "k3"
+    c.validate(cfg, known_providers=KNOWN)
+    ml = {m["model_name"]: m["litellm_params"] for m in c.to_litellm_config(cfg)["model_list"]}
+    # K3 handles BOTH text and images — coder AND multimodal (and the * catch-all) point at it.
+    assert ml["coder"]["model"] == "openrouter/moonshotai/kimi-k3"
+    assert ml["multimodal"]["model"] == "openrouter/moonshotai/kimi-k3"
+    assert ml["*"]["model"] == "openrouter/moonshotai/kimi-k3"
+    # int4 safety (Gate B): K3's only OpenRouter endpoint is int4, so a fp8-or-better quant pin
+    # would leave zero eligible providers. EVERY kimi-k3 route must emit NO extra_body.
+    for name, p in ml.items():
+        if p["model"] == "openrouter/moonshotai/kimi-k3":
+            assert "extra_body" not in p, f"{name}: kimi-k3 route must not pin quantization (int4)"
+    # background stays cheap on GLM-flash with its fp8 floor (K3 is $3/$15 — wasteful there).
+    assert ml["background"]["model"] == "openrouter/z-ai/glm-4.7-flash"
+    assert ml["background"]["extra_body"]["provider"]["quantizations"] == ["fp8", "fp16", "bf16", "fp32"]
+
+
+def test_validate_rejects_both_routes_and_profiles():
+    cfg = base()
+    cfg["routes"] = {"coder": {"provider": "openrouter", "model": "z-ai/glm-5.2"}}
+    with pytest.raises(c.ConfigError):
+        c.validate(cfg, known_providers=KNOWN)
+
+
+def test_validate_rejects_profiles_without_active_profile():
+    cfg = base()
+    del cfg["active_profile"]
+    with pytest.raises(c.ConfigError):
+        c.validate(cfg, known_providers=KNOWN)
+
+
+def test_validate_rejects_active_profile_without_profiles():
+    cfg = {
+        "schema_version": 1,
+        "providers": {"openrouter": {"type": "openrouter", "api_key_env": "OPENROUTER_API_KEY"}},
+        "active_profile": "glm",
+        "mapping": {"opus": "coder"},
+    }
+    with pytest.raises(c.ConfigError):
+        c.validate(cfg, known_providers=KNOWN)
+
+
+def test_validate_rejects_unknown_active_profile():
+    cfg = base()
+    cfg["active_profile"] = "ghost"
+    with pytest.raises(c.ConfigError):
+        c.validate(cfg, known_providers=KNOWN)
+
+
+def test_validate_rejects_non_dict_profile_bundle_with_configerror():
+    # Gate B #1: a hand-edited `k3:` line with nothing under it parses to None — must be a
+    # friendly ConfigError, NOT a raw TypeError that escapes the CLI's error handler.
+    for bad in (None, ["a"], "oops"):
+        cfg = base()
+        cfg["profiles"]["k3"] = bad
+        with pytest.raises(c.ConfigError):
+            c.validate(cfg, known_providers=KNOWN)
+
+
+def test_validate_rejects_non_string_provider_or_model():
+    # Gate B #2: a list `provider` would otherwise raise TypeError (unhashable) at the
+    # membership check; a list/empty `model` would bake a broken "openrouter/['a','b']" string.
+    for mutate in (
+        lambda r: r["coder"].__setitem__("provider", ["openrouter"]),
+        lambda r: r["coder"].__setitem__("model", ["a", "b"]),
+        lambda r: r["coder"].__setitem__("model", ""),
+    ):
+        cfg = base()
+        mutate(c.resolved_routes(cfg))
+        with pytest.raises(c.ConfigError):
+            c.validate(cfg, known_providers=KNOWN)
+
+
+def test_validate_rejects_defect_in_inactive_profile():
+    # Gate B #3: validate must check EVERY profile, not just the active one — otherwise an
+    # "only-active" implementation would be fake-green while shipping a broken profile.
+    cfg = base()
+    cfg["active_profile"] = "glm"
+    cfg["profiles"]["k3"]["coder"]["provider"] = "ghost"  # break the INACTIVE profile
+    with pytest.raises(c.ConfigError):
+        c.validate(cfg, known_providers=KNOWN)
+
+
+def test_legacy_config_validates_and_generates():
+    cfg = legacy_config()
+    c.validate(cfg, known_providers=KNOWN)  # must not raise
+    out = c.to_litellm_config(cfg)
+    coder = next(m for m in out["model_list"] if m["model_name"] == "coder")
+    assert coder["litellm_params"]["model"] == "openrouter/z-ai/glm-5.2"
+    assert c.active_key_envs(cfg) == ["OPENROUTER_API_KEY"]
+
+
+@pytest.mark.parametrize("break_it", [
+    lambda cfg: cfg["routes"].pop("multimodal"),
+    lambda cfg: cfg["routes"]["coder"].__setitem__("provider", "ghost"),
+    lambda cfg: cfg["routes"]["coder"].__setitem__("extra_body", ["nope"]),
+])
+def test_legacy_reject_path_preserved(break_it):
+    # The refactor extracted a shared bundle validator; the legacy branch must still reject the
+    # same defects (guards against the legacy path being silently gutted).
+    cfg = legacy_config()
+    break_it(cfg)
+    with pytest.raises(c.ConfigError):
+        c.validate(cfg, known_providers=KNOWN)

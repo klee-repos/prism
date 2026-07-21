@@ -1,5 +1,11 @@
 """Unit tests for CLI arg partitioning + Claude Code passthrough fidelity."""
+import os
+import stat
+
+import pytest
+
 from prism import cli
+from prism import config as cfgmod
 
 
 def test_no_args_is_passthrough():
@@ -96,3 +102,118 @@ def test_main_prism_error_uses_reserved_exit_code(monkeypatch):
 
     monkeypatch.setitem(cli._MGMT, "doctor", boom)
     assert cli.main(["doctor"]) == cli.EXIT_PRISM_ERROR
+
+
+# ── `prism profile` (list + one-word switch) ────────────────────────────────────────
+
+def test_partition_args_profile_is_mgmt():
+    assert cli.partition_args(["profile"]) == ("mgmt", "profile", [])
+    assert cli.partition_args(["profile", "k3"]) == ("mgmt", "profile", ["k3"])
+    # the escape hatch still forwards the word to claude
+    assert cli.partition_args(["--", "profile"]) == ("passthrough", None, ["profile"])
+
+
+def test_set_active_profile_text_guards():
+    f = cli._set_active_profile_text
+    assert f("active_profile: glm  # x\n", "k3") == "active_profile: k3  # x\n"  # inline comment kept
+    assert f('active_profile: "glm"\n', "k3") == 'active_profile: "k3"\n'        # quotes kept
+    assert f("active_profile:\n", "k3") is None                                 # empty value -> guard
+    assert f("routes:\n  coder: {}\n", "k3") is None                            # no line -> guard (no clobber)
+    assert f("active_profile: a\nactive_profile: b\n", "z") is None             # duplicate -> refuse
+    # a comment line that merely mentions active_profile is never edited
+    r = f("# edit active_profile: here\nactive_profile: glm\n", "k3")
+    assert r is not None
+    assert "# edit active_profile: here" in r and "active_profile: k3" in r
+    # a name with regex-special chars is inserted literally (no backref corruption)
+    assert f("active_profile: glm\n", r"a\1b") == "active_profile: a\\1b\n"
+
+
+@pytest.fixture()
+def prism_home_default(tmp_path, monkeypatch):
+    """An isolated PRISM_HOME seeded with the SHIPPED default config (so comment-preservation
+    assertions are meaningful and the dev's real ~/.prism is never touched)."""
+    home = tmp_path / ".prism"
+    monkeypatch.setenv("PRISM_HOME", str(home))
+    home.mkdir(parents=True)
+    cfgmod.config_path().write_text(cfgmod._default_config_text())
+    return home
+
+
+def test_profile_list_marks_active(prism_home_default, capsys):
+    rc = cli.cmd_profile([])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "active profile: glm" in out
+    assert "* glm" in out and "k3" in out
+    assert "moonshotai/kimi-k3" in out  # k3's coder + multimodal model is shown
+
+
+def test_profile_switch_flips_and_preserves_comments(prism_home_default):
+    assert cli.cmd_profile(["k3"]) == 0
+    text = cfgmod.config_path().read_text()
+    assert any(l.strip().startswith("active_profile: k3") for l in text.splitlines())
+    # the shipped default's comments survived the in-place rewrite (a whole-file rewrite fails here)
+    assert "# Prism config — edit freely" in text
+    assert "the one word that switches everything" in text
+    # and the config now resolves to k3 for text AND vision
+    cfg = cfgmod.load_config()
+    assert cfgmod._route_model_string(cfg, "coder") == "openrouter/moonshotai/kimi-k3"
+    assert cfgmod._route_model_string(cfg, "multimodal") == "openrouter/moonshotai/kimi-k3"
+
+
+def test_profile_switch_preserves_0600_perms(prism_home_default):
+    cli.cmd_profile(["k3"])
+    assert stat.S_IMODE(os.stat(cfgmod.config_path()).st_mode) == 0o600
+
+
+def test_profile_switch_idempotent_message(prism_home_default, capsys):
+    cli.cmd_profile(["glm"])
+    assert "already on profile 'glm'." in capsys.readouterr().out
+
+
+def test_profile_switch_unknown_name_errors(prism_home_default):
+    with pytest.raises(cli.PrismError):
+        cli.cmd_profile(["nope"])
+
+
+def test_profile_switch_ignores_flags(prism_home_default, capsys):
+    # A stray flag must not be treated as a profile name (would give a confusing 'unknown profile').
+    rc = cli.cmd_profile(["--help"])  # no positional name -> falls back to list
+    assert rc == 0 and "active profile:" in capsys.readouterr().out
+
+
+def test_profile_on_legacy_config_errors_clearly(tmp_path, monkeypatch):
+    home = tmp_path / ".prism"
+    monkeypatch.setenv("PRISM_HOME", str(home))
+    home.mkdir(parents=True)
+    cfgmod.config_path().write_text(
+        "schema_version: 1\n"
+        "providers:\n  openrouter: {type: openrouter, api_key_env: OPENROUTER_API_KEY}\n"
+        "routes:\n"
+        "  coder: {provider: openrouter, model: z-ai/glm-5.2}\n"
+        "  background: {provider: openrouter, model: z-ai/glm-4.7-flash}\n"
+        "  multimodal: {provider: openrouter, model: google/gemini-2.5-flash}\n"
+        "mapping: {opus: coder, sonnet: coder, haiku: background}\n"
+    )
+    with pytest.raises(cli.PrismError):
+        cli.cmd_profile(["k3"])   # switch on a no-profiles config
+    with pytest.raises(cli.PrismError):
+        cli.cmd_profile([])       # list on a no-profiles config
+
+
+def test_status_on_bad_active_profile_prints_config_error_not_traceback(tmp_path, monkeypatch, capsys):
+    home = tmp_path / ".prism"
+    monkeypatch.setenv("PRISM_HOME", str(home))
+    home.mkdir(parents=True)
+    text = cfgmod._default_config_text().replace("active_profile: glm", "active_profile: ghost")
+    cfgmod.config_path().write_text(text)
+    rc = cli.cmd_status([])  # must NOT raise a KeyError/traceback
+    out = capsys.readouterr().out
+    assert rc == 0 and "config error" in out
+
+
+def test_status_shows_active_profile_line(prism_home_default, capsys):
+    cli.cmd_status([])
+    out = capsys.readouterr().out
+    assert "active profile -> glm" in out
+    assert "coder" in out and "z-ai/glm-5.2" in out

@@ -226,6 +226,67 @@ def test_tool_result_nested_image_routes_to_multimodal(running_proxy):
     assert mock.requests[-1]["model"] == "prism-mm-model"
 
 
+@pytest.fixture()
+def running_proxy_k3_profile(tmp_path, monkeypatch):
+    """A REAL litellm proxy booted from a PROFILES config with `active_profile: k3`. Proves the
+    whole new chain — active-profile resolution -> to_litellm_config -> litellm boot -> the
+    routing hook — end to end, verified by what the mock upstream actually received."""
+    monkeypatch.setenv("PRISM_HOME", str(tmp_path / ".prism"))
+    monkeypatch.setenv("PRISM_TEST_KEY", "sk-dummy-not-real")
+    with MockUpstream() as mock:
+        cfg = {
+            "schema_version": 1,
+            "active_profile": "k3",
+            "providers": {"mock": {
+                # openrouter type -> chat-completions path + Anthropic->OpenAI image conversion,
+                # the exact path moonshotai/kimi-k3 uses in production.
+                "type": "openrouter", "api_key_env": "PRISM_TEST_KEY",
+                "api_base": f"http://127.0.0.1:{mock.port}",
+            }},
+            "profiles": {
+                "glm": {
+                    "coder": {"provider": "mock", "model": "z-ai/glm-5.2"},
+                    "background": {"provider": "mock", "model": "z-ai/glm-4.7-flash"},
+                    "multimodal": {"provider": "mock", "model": "google/gemini-2.5-flash"},
+                },
+                "k3": {
+                    "coder": {"provider": "mock", "model": "moonshotai/kimi-k3"},
+                    "background": {"provider": "mock", "model": "z-ai/glm-4.7-flash"},
+                    "multimodal": {"provider": "mock", "model": "moonshotai/kimi-k3"},
+                },
+            },
+            "mapping": {"opus": "coder", "sonnet": "coder", "haiku": "background"},
+        }
+        home = cfgmod.prism_home()
+        home.mkdir(parents=True, exist_ok=True)
+        cfgmod.config_path().write_text(yaml.safe_dump(cfg))
+        cli._write_hook_shim()
+        proxy = proxymod.start(cfg)
+        try:
+            yield mock, proxy
+        finally:
+            proxy.stop()
+
+
+def test_k3_profile_text_and_image_both_route_to_kimi(running_proxy_k3_profile):
+    # Deterministic real-artifact verdict: with the k3 profile active, a TEXT request AND an
+    # IMAGE request must BOTH reach the upstream as moonshotai/kimi-k3 — K3 serves vision too,
+    # so no separate model is needed. The mock records the underlying model; the LLM decides
+    # nothing. Red/green: point k3.multimodal at a different model and the image assert fails.
+    mock, proxy = running_proxy_k3_profile
+    _send(proxy, [{"role": "user", "content": "hello there"}])
+    assert mock.requests[-1]["model"] == "moonshotai/kimi-k3", "text did not route to k3 coder"
+    _send(proxy, [{
+        "role": "user",
+        "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMG_B64}},
+            {"type": "text", "text": "what is this"},
+        ],
+    }])
+    assert mock.requests[-1]["model"] == "moonshotai/kimi-k3", "image did not route to k3 multimodal"
+    assert mock.requests[-1]["had_image"] is True, "the image did not actually reach the upstream"
+
+
 def test_hosted_web_search_tool_is_stripped_before_upstream(running_proxy):
     # No search provider configured → strip the hosted tool (backends can't run it),
     # keep custom tools. This is the default and the guard against the
@@ -469,4 +530,3 @@ def test_disconnect_metadata_patch_handles_none():
     # The bug: None / a non-dict must NOT raise.
     fn(None)
     fn("not-a-dict")
-

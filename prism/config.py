@@ -91,6 +91,70 @@ def load_config(path: Path | None = None) -> dict:
     return cfg
 
 
+def _uses_profiles(cfg: dict) -> bool:
+    """True when the config opts into named profiles (either key present).
+
+    The predicate is deliberately EITHER-key so ``resolved_routes`` and ``validate`` can
+    never disagree: presence of one without the other is a half-finished profiles config
+    that ``validate`` rejects, not a silent fall-through to the legacy ``routes`` path.
+    """
+    return "profiles" in cfg or "active_profile" in cfg
+
+
+def resolved_routes(cfg: dict) -> dict:
+    """The active route bundle: the selected profile's routes, or the legacy top-level
+    ``routes``. Returns a LIVE reference (callers may read/mutate it).
+
+    Raises ``ConfigError`` — never a bare ``KeyError`` — so even callers that skip
+    ``validate`` first (e.g. ``prism status`` on a hand-broken config) degrade to a
+    friendly message instead of a traceback.
+    """
+    if _uses_profiles(cfg):
+        profiles = cfg.get("profiles")
+        if not isinstance(profiles, dict) or not profiles:
+            raise ConfigError(
+                "`profiles` must be a non-empty mapping (or omit it for a flat `routes` config)."
+            )
+        active = cfg.get("active_profile")
+        if not isinstance(active, str) or active not in profiles:
+            raise ConfigError(
+                f"active_profile {active!r} is not a defined profile (have: {', '.join(profiles)})."
+            )
+        bundle = profiles[active]
+        if not isinstance(bundle, dict):
+            raise ConfigError(f"profile '{active}' must be a mapping of routes.")
+        return bundle
+    routes = cfg.get("routes")
+    if not isinstance(routes, dict) or not routes:
+        raise ConfigError("config needs either `routes` (legacy) or `profiles` + `active_profile`.")
+    return routes
+
+
+def _validate_route_bundle(routes: Any, providers: dict, label: str) -> None:
+    """Validate one route bundle. Shared by the legacy flat ``routes`` and by EVERY named
+    profile so both shapes reject the same defects. Raises ``ConfigError`` (never a raw
+    ``TypeError``/``KeyError``) on any malformed bundle — a bundle that is ``None``/list/str
+    (e.g. a hand-edited ``k3:`` line with nothing under it) is caught here, not later.
+    """
+    if not isinstance(routes, dict) or not routes:
+        raise ConfigError(f"{label} must be a non-empty mapping of routes.")
+    for role in REQUIRED_ROLES:
+        if role not in routes:
+            raise ConfigError(f"{label}: missing required route '{role}' (need: {', '.join(REQUIRED_ROLES)}).")
+        r = routes[role]
+        if not isinstance(r, dict) or "provider" not in r or "model" not in r:
+            raise ConfigError(f"{label}: route '{role}' needs `provider` and `model`.")
+        prov, model = r["provider"], r["model"]
+        if not isinstance(prov, str) or not prov:
+            raise ConfigError(f"{label}: route '{role}' `provider` must be a non-empty string.")
+        if not isinstance(model, str) or not model:
+            raise ConfigError(f"{label}: route '{role}' `model` must be a non-empty string.")
+        if prov not in providers:
+            raise ConfigError(f"{label}: route '{role}' references provider '{prov}' which is not defined.")
+        if "extra_body" in r and not isinstance(r["extra_body"], dict):
+            raise ConfigError(f"{label}: route '{role}' has a non-mapping `extra_body` (must be a YAML mapping).")
+
+
 def validate(cfg: dict, known_providers: set[str] | None = None) -> None:
     """Referential + slug validation. ``known_providers`` defaults to litellm's list."""
     if cfg.get("schema_version") != SCHEMA_VERSION:
@@ -99,12 +163,9 @@ def validate(cfg: dict, known_providers: set[str] | None = None) -> None:
             "your config may be from a different Prism version."
         )
     providers = cfg.get("providers") or {}
-    routes = cfg.get("routes") or {}
     mapping = cfg.get("mapping") or {}
     if not isinstance(providers, dict) or not providers:
         raise ConfigError("`providers` must be a non-empty mapping.")
-    if not isinstance(routes, dict):
-        raise ConfigError("`routes` must be a mapping.")
 
     if known_providers is None:
         known_providers = _litellm_provider_list()
@@ -122,23 +183,36 @@ def validate(cfg: dict, known_providers: set[str] | None = None) -> None:
         if "api_key_env" not in prov:
             raise ConfigError(f"provider '{name}' needs `api_key_env` (the env var holding the key).")
 
-    for role in REQUIRED_ROLES:
-        if role not in routes:
-            raise ConfigError(f"missing required route '{role}' (need: {', '.join(REQUIRED_ROLES)}).")
-        r = routes[role]
-        if not isinstance(r, dict) or "provider" not in r or "model" not in r:
-            raise ConfigError(f"route '{role}' needs `provider` and `model`.")
-        if r["provider"] not in providers:
+    # Routes come from EITHER a flat `routes` block (legacy) or named `profiles` selected by
+    # `active_profile` — never both. Validate EVERY profile bundle (not just the active one) so
+    # a broken inactive profile is caught at setup, not on the switch into it.
+    if "routes" in cfg and _uses_profiles(cfg):
+        raise ConfigError(
+            "config has both `routes` and `profiles` — use one (a flat `routes` block, or "
+            "`profiles` + `active_profile`)."
+        )
+    if _uses_profiles(cfg):
+        profiles = cfg.get("profiles")
+        active = cfg.get("active_profile")
+        if not isinstance(profiles, dict) or not profiles:
+            raise ConfigError("`profiles` must be a non-empty mapping when `active_profile` is set.")
+        if not isinstance(active, str) or not active:
+            raise ConfigError("`active_profile` must be the name of a profile (a non-empty string).")
+        if active not in profiles:
             raise ConfigError(
-                f"route '{role}' references provider '{r['provider']}' which is not defined."
+                f"active_profile '{active}' is not a defined profile (have: {', '.join(profiles)})."
             )
-        if "extra_body" in r and not isinstance(r["extra_body"], dict):
-            raise ConfigError(f"route '{role}' has a non-mapping `extra_body` (must be a YAML mapping).")
+        for name, bundle in profiles.items():
+            _validate_route_bundle(bundle, providers, f"profile '{name}'")
+        active_routes = profiles[active]
+    else:
+        _validate_route_bundle(cfg.get("routes"), providers, "routes")
+        active_routes = cfg["routes"]
 
     for slot, target in mapping.items():
         if slot not in MAPPING_SLOTS:
             raise ConfigError(f"mapping has unknown slot '{slot}' (allowed: {', '.join(MAPPING_SLOTS)}).")
-        if target not in routes:
+        if target not in active_routes:
             raise ConfigError(f"mapping.{slot} → '{target}' is not a defined route.")
 
     _validate_search(cfg)
@@ -191,13 +265,22 @@ def _litellm_provider_list() -> set[str]:
 
 
 def _route_model_string(cfg: dict, role: str) -> str:
-    route = cfg["routes"][role]
-    prov = cfg["providers"][route["provider"]]
+    # Defensive: this is the one route reader `cmd_status` calls WITHOUT validating first,
+    # so it must raise ConfigError (which callers catch) rather than a bare KeyError.
+    bundle = resolved_routes(cfg)
+    if role not in bundle:
+        raise ConfigError(f"route '{role}' is not defined in the active configuration.")
+    route = bundle[role]
+    if not isinstance(route, dict) or "provider" not in route or "model" not in route:
+        raise ConfigError(f"route '{role}' needs `provider` and `model`.")
+    prov = (cfg.get("providers") or {}).get(route["provider"])
+    if not isinstance(prov, dict) or "type" not in prov:
+        raise ConfigError(f"route '{role}' references an undefined provider '{route.get('provider')}'.")
     return f"{prov['type']}/{route['model']}"
 
 
 def _route_params(cfg: dict, role: str) -> dict:
-    route = cfg["routes"][role]
+    route = resolved_routes(cfg)[role]
     prov = cfg["providers"][route["provider"]]
     params: dict[str, Any] = {
         "model": _route_model_string(cfg, role),
@@ -283,12 +366,16 @@ def mapping_env(cfg: dict) -> dict[str, str]:
 def active_key_envs(cfg: dict) -> list[str]:
     """Env vars whose keys the active (mapped) routes need — for the pre-flight check."""
     mapping = cfg.get("mapping") or {}
-    routes = cfg.get("routes") or {}
+    try:
+        routes = resolved_routes(cfg)  # the ACTIVE profile's routes (or legacy flat routes)
+    except ConfigError:
+        routes = {}  # a broken config surfaces via validate() elsewhere; don't crash preflight
     providers = cfg.get("providers") or {}
     envs: list[str] = []
     active_roles = set(mapping.values()) | {"coder", "multimodal"}
     for role in active_roles:
-        route = routes.get(role) or {}
+        route = routes.get(role) if isinstance(routes, dict) else None
+        route = route or {}
         prov = providers.get(route.get("provider")) or {}
         env = prov.get("api_key_env")
         if env and env not in envs:

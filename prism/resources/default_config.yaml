@@ -1,9 +1,14 @@
 # Prism config — edit freely. The command you run stays `prism`.
 #
-# Swap providers by editing this file only (never any code). `providers.<name>.type`
-# is a litellm provider slug (openrouter, zai, openai, gemini, anthropic, …) and is
-# what decides which backend a route calls. Model ids are provider-native:
-#   - OpenRouter carries a vendor segment:  z-ai/glm-5.2 , google/gemini-2.5-flash
+# Swap models by editing this file only (never any code). A "profile" is a named set of
+# routes; `active_profile` picks the one in use. Switch with a single word here, or run:
+#     prism profile k3      (use Kimi K3 for text AND images)
+#     prism profile glm     (back to GLM for text + Gemini for images)
+#     prism profile         (list profiles, marks the active one)
+#
+# `providers.<name>.type` is a litellm provider slug (openrouter, zai, openai, gemini,
+# anthropic, …) and decides which backend a route calls. Model ids are provider-native:
+#   - OpenRouter carries a vendor segment:  z-ai/glm-5.2 , moonshotai/kimi-k3
 #   - Direct providers use bare ids:        glm-5.2 (zai) , gpt-4o-mini (openai)
 #
 # Routing: text/coding -> `coder`; images & files -> `multimodal`; cheap background
@@ -11,67 +16,90 @@
 
 schema_version: 1
 
+# ── Pick your setup ────────────────────────────────────────────────────────────────
+active_profile: glm          # the one word that switches everything (glm | k3)
+
 providers:
   openrouter:
     type: openrouter
     api_key_env: OPENROUTER_API_KEY
     # api_base: https://openrouter.ai/api/v1   # (optional override; native default is fine)
 
-routes:
-  coder:
-    provider: openrouter
-    model: z-ai/glm-5.2
-    # OpenRouter serves one model id from several upstream providers and load-balances
-    # on price/uptime by default. Claude Code leans hard on tool calls and consistent
-    # quality, so pin the coder route: `require_parameters` keeps it on providers that
-    # honor the tools/params we send, and `quantizations` restricts to FP8-or-better
-    # (excludes int4/int8/fp4/fp6 and undeclared `unknown`). See OpenRouter provider
-    # routing docs. Any keys under `extra_body` pass through to the backend verbatim.
-    extra_body:
-      provider:
-        require_parameters: true
-        quantizations: [fp8, fp16, bf16, fp32]
-  background:
-    provider: openrouter
-    model: z-ai/glm-4.7-flash
-    extra_body:
-      provider:
-        quantizations: [fp8, fp16, bf16, fp32]   # same FP8-or-better quality floor as coder
-  multimodal:
-    provider: openrouter
-    model: google/gemini-2.5-flash
+profiles:
+  # GLM for text/code + Google Gemini for images. Two specialized models — the default.
+  glm:
+    coder:
+      provider: openrouter
+      model: z-ai/glm-5.2
+      # OpenRouter serves one model id from several upstream providers and load-balances
+      # on price/uptime. Claude Code leans hard on tool calls and consistent quality, so
+      # pin the coder route: `require_parameters` keeps it on providers that honor the
+      # tools/params we send, and `quantizations` restricts to FP8-or-better (excludes
+      # int4/int8/fp4/fp6 and undeclared `unknown`). Keys under `extra_body` pass through
+      # to the backend verbatim. See OpenRouter provider-routing docs.
+      extra_body:
+        provider:
+          require_parameters: true
+          quantizations: [fp8, fp16, bf16, fp32]
+    background:
+      provider: openrouter
+      model: z-ai/glm-4.7-flash
+      extra_body:
+        provider:
+          quantizations: [fp8, fp16, bf16, fp32]   # same FP8-or-better quality floor as coder
+    multimodal:
+      provider: openrouter
+      model: google/gemini-2.5-flash
 
-# Which Claude Code tier maps to which route.
+  # Kimi K3 — one multimodal model for BOTH text and images (coder AND multimodal point
+  # at it, so no separate vision model is needed). K3 is pricier ($3/$15 per 1M) than GLM,
+  # so `background` (cheap, high-volume haiku-tier work) deliberately stays on GLM-flash.
+  #
+  # NOTE: K3's only OpenRouter endpoint is served at int4 quantization, so the K3 routes
+  # carry NO `quantizations`/`require_parameters` pin — an FP8-or-better pin (like glm's)
+  # would exclude K3's sole provider and every request would fail. Single provider =
+  # nothing to load-balance or restrict.
+  k3:
+    coder:
+      provider: openrouter
+      model: moonshotai/kimi-k3
+    background:
+      provider: openrouter
+      model: z-ai/glm-4.7-flash
+      extra_body:
+        provider:
+          quantizations: [fp8, fp16, bf16, fp32]
+    multimodal:
+      provider: openrouter
+      model: moonshotai/kimi-k3
+
+# Which Claude Code tier maps to which route (applies to whichever profile is active).
 mapping:
   opus: coder
   sonnet: coder
   haiku: background
 
 # ── Web search (optional) ─────────────────────────────────────────────────────────
-# Claude Code's built-in WebSearch is a hosted Anthropic tool that GLM/Gemini can't
-# run — without a search provider wired, Prism strips it (the model just won't call
-# it). To keep WebSearch working on the cheap coder model, configure a search
-# provider: Prism converts the tool to a callable function, and litellm's
-# websearch_interception callback runs the search via `litellm.asearch` then feeds
-# the results back to the model. Get a key from the provider's dashboard.
+# Claude Code's built-in WebSearch is a hosted Anthropic tool that the cheap backends
+# can't run — without a search provider wired, Prism strips it (the model just won't
+# call it). To keep WebSearch working, configure a search provider: Prism converts the
+# tool to a callable function, and litellm's websearch_interception callback runs the
+# search via `litellm.asearch` then feeds the results back to the model.
 #
 # search:
 #   provider: firecrawl          # litellm search slug (firecrawl, tavily, perplexity,
 #                                #   serper, exa_ai, brave, … keyless: duckduckgo)
 #   api_key_env: FIRECRAWL_API_KEY  # env var holding the key (omit for keyless)
 
-# ── Example: swap the coder to GLM direct from z.ai (no code change) ──────────────
-# providers:
-#   zai:
-#     type: zai                 # native litellm provider: auto base + reads the key env
-#     api_key_env: ZAI_API_KEY
-# routes:
-#   coder:   { provider: zai, model: glm-5.2 }
+# ── Add your own provider (no code change) ────────────────────────────────────────
+# Use GLM direct from z.ai (no middleman), or any other litellm provider slug:
+#   providers:
+#     zai: { type: zai, api_key_env: ZAI_API_KEY }   # native: auto base + reads the key env
+#   profiles:
+#     glm:
+#       coder: { provider: zai, model: glm-5.2 }
+# Other `type` values: openai, gemini, anthropic, azure, bedrock, and more.
 #
-# ── Example: multimodal via Gemini direct (Google AI Studio) ─────────────────────
-# providers:
-#   gemini:
-#     type: gemini
-#     api_key_env: GEMINI_API_KEY
-# routes:
-#   multimodal: { provider: gemini, model: gemini-2.5-flash }
+# ── Legacy shape (still supported) ────────────────────────────────────────────────
+# Older configs use a single top-level `routes:` block with no profiles — that still
+# works unchanged. `prism profile` requires a `profiles:` section like the one above.

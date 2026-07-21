@@ -7,6 +7,7 @@ Use `prism -- <args>` to force a collision word through to claude.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -14,7 +15,7 @@ import sys
 from . import config as cfgmod
 from . import proxy as proxymod
 
-RESERVED_VERBS = {"setup", "status", "doctor"}
+RESERVED_VERBS = {"setup", "status", "doctor", "profile"}
 INFORMATIONAL = {"--help", "-h", "--version", "-v"}
 # Real `claude` subcommands that issue no model completion → don't gate on API keys.
 NO_COMPLETION_SUBCOMMANDS = {
@@ -156,6 +157,9 @@ def cmd_status(_args: list[str]) -> int:
         try:
             cfg = cfgmod.load_config()
             print(f"config_hash: {cfgmod.config_hash(cfg)}")
+            active = cfg.get("active_profile")
+            if active and cfg.get("profiles"):
+                print(f"  active profile -> {active}")
             for role in cfgmod.REQUIRED_ROLES:
                 print(f"  {role:11s} -> {cfgmod._route_model_string(cfg, role)}")
             search = (cfg.get("search") or {}).get("provider")
@@ -164,6 +168,92 @@ def cmd_status(_args: list[str]) -> int:
             print(f"config error: {e}")
     else:
         print("no config yet — run `prism setup`.")
+    return 0
+
+
+# Matches a top-level (column-0, non-comment) `active_profile:` line. Anchored at start of
+# line (re.M) so an INDENTED occurrence or one inside a `# comment` is never touched. Groups:
+# (1) the `active_profile:` prefix + spacing, (2) an optional surrounding quote, (3) the value,
+# (4) trailing spacing + any inline `# comment`. Only group 3 is replaced — quotes and the
+# inline comment survive the switch.
+_ACTIVE_PROFILE_RE = re.compile(
+    r"""^(active_profile:[ \t]*)(["']?)([^"'#\r\n]+?)\2([ \t]*(?:#.*)?)$""",
+    re.MULTILINE,
+)
+
+
+def _set_active_profile_text(text: str, name: str) -> str | None:
+    """Return ``text`` with the single top-level ``active_profile:`` value set to ``name``,
+    or ``None`` if there is not exactly one such line (0 → nothing to update; >1 → refuse
+    rather than guess). A replacement *function* (not a string) inserts ``name`` literally,
+    so a value with regex-special characters can't corrupt the edit."""
+    matches = _ACTIVE_PROFILE_RE.findall(text)
+    if len(matches) != 1:
+        return None
+    return _ACTIVE_PROFILE_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{name}{m.group(2)}{m.group(4)}", text, count=1
+    )
+
+
+def _switch_active_profile(name: str) -> None:
+    """Flip ``active_profile`` in the on-disk config, preserving comments/formatting.
+
+    Validate the *result* in memory BEFORE writing, so a bad edit never lands on disk; write
+    in place (truncate keeps the 0600 inode) and re-assert 0600 to match the config's perms.
+    """
+    import yaml
+
+    path = cfgmod.config_path()
+    new_text = _set_active_profile_text(path.read_text(), name)
+    if new_text is None:
+        raise PrismError(
+            "couldn't find a single top-level `active_profile:` line to update — this config "
+            "may use the legacy flat `routes` shape (no profiles), or have an unusual layout. "
+            "Set `active_profile:` by hand (see the config comments)."
+        )
+    try:
+        new_cfg = yaml.safe_load(new_text)
+    except yaml.YAMLError as e:
+        raise PrismError(f"the switch would produce invalid YAML ({e}); config left unchanged.")
+    cfgmod.validate(new_cfg)  # ConfigError if the result is invalid → file left untouched
+    path.write_text(new_text)
+    os.chmod(path, 0o600)
+
+
+def cmd_profile(args: list[str]) -> int:
+    """`prism profile` lists profiles (marking the active one); `prism profile <name>`
+    switches to it. Only defined for configs that use a `profiles:` section."""
+    cfg = cfgmod.load_config()
+    profiles = cfg.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise PrismError(
+            "this config has no `profiles` section — it uses the legacy flat `routes` shape. "
+            "Add a `profiles:` section (see the config comments / README) to use `prism profile`."
+        )
+    active = cfg.get("active_profile")
+    # Positional profile name only: ignore flags (so a stray `--help` isn't read as a profile
+    # name) and any extra positional args.
+    names = [a for a in args if not a.startswith("-")]
+    if not names:
+        print(f"active profile: {active}")
+        for name in profiles:
+            bundle = profiles[name] if isinstance(profiles[name], dict) else {}
+            coder = bundle.get("coder") or {}
+            mm = bundle.get("multimodal") or {}
+            mark = "*" if name == active else " "
+            print(
+                f"  {mark} {name:10s} coder={coder.get('provider')}/{coder.get('model')}"
+                f"  multimodal={mm.get('provider')}/{mm.get('model')}"
+            )
+        return 0
+    target = names[0]
+    if target not in profiles:
+        raise PrismError(f"unknown profile '{target}' (have: {', '.join(profiles)}).")
+    if target == active:
+        print(f"already on profile '{target}'.")
+        return 0
+    _switch_active_profile(target)
+    print(f"switched to profile '{target}'. Exit and re-run `prism` to pick up the new profile.")
     return 0
 
 
@@ -234,7 +324,7 @@ def run_passthrough(forward_args: list[str]) -> int:
 
 # ── entrypoint ────────────────────────────────────────────────────────────────────
 
-_MGMT = {"setup": cmd_setup, "status": cmd_status, "doctor": cmd_doctor}
+_MGMT = {"setup": cmd_setup, "status": cmd_status, "doctor": cmd_doctor, "profile": cmd_profile}
 
 
 def main(argv: list[str] | None = None) -> int:
